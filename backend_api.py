@@ -83,7 +83,8 @@ def midi_to_pdf(midi_path: Path, pdf_path: Path) -> Path:
     """MIDI → PDF через MuseScore CLI или LilyPond (fallback)."""
     try:
         # Ищем MuseScore
-        mscore = shutil.which("mscore") or shutil.which("mscore4") or shutil.which("musescore")
+        mscore = shutil.which("mscore") or shutil.which("mscore4") or shutil.which("musescore") or shutil.which("musescore3")
+
 
         if mscore:
             subprocess.run(
