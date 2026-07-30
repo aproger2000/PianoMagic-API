@@ -3,5 +3,6 @@ uvicorn[standard]==0.32.0
 python-multipart==0.0.17
 basic-pitch==0.4.0
 music21==9.3.0
-yt-dlp==2025.7.30
+yt-dlp
 numpy<2.0.0
+
