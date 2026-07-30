@@ -1,90 +1,82 @@
 """
-PianoMagic — Audio-to-Sheet Music Transcription API
-FastAPI + Basic Pitch + MuseScore
+PianoMagic API v2 — с фоновой обработкой
+FastAPI + Basic Pitch + Background Tasks
 
-Запуск локально:
-    uvicorn backend_api:app --reload
-
-Деплой:
-    Render / Railway / Hugging Face Spaces
+Паттерн: upload → get job_id → poll status → download PDF
 """
 
+import asyncio
 import os
 import shutil
 import subprocess
 import uuid
 from pathlib import Path
-from typing import Optional
+from concurrent.futures import ThreadPoolExecutor
 
-import yt_dlp
-from basic_pitch.inference import predict
-from fastapi import FastAPI, File, Form, UploadFile, HTTPException
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from music21 import converter, instrument
+from basic_pitch.inference import predict
 
 app = FastAPI(
-    title="PianoMagic API",
-    description="Транскрипция аудио в ноты для фортепиано",
-    version="1.0.0"
+    title="PianoMagic API v2",
+    description="Транскрипция аудио в ноты (async)",
+    version="2.0.0"
 )
 
-# CORS — разрешаем запросы с GitHub Pages / Vercel / localhost
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # В продакшене замените на конкретный домен
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=3600,
 )
 
-# Директории
 TEMP_DIR = Path("temp")
 OUTPUT_DIR = Path("output")
 TEMP_DIR.mkdir(exist_ok=True)
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-# Максимальный размер файла (50 МБ)
 MAX_FILE_SIZE = 50 * 1024 * 1024
 
+# Хранилище статусов задач
+jobs = {}
 
-def download_audio(url: str, output_path: Path) -> Path:
-    """Скачивание аудио с YouTube, SoundCloud, и т.д."""
+# Пул потоков для тяжёлых задач (TensorFlow)
+executor = ThreadPoolExecutor(max_workers=1)
+
+
+def process_audio_sync(job_id: str, input_path: Path):
+    """Синхронная обработка в отдельном потоке."""
     try:
-        ydl_opts = {
-            "format": "bestaudio/best",
-            "outtmpl": str(output_path.with_suffix("")),
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "wav",
-                "preferredquality": "192",
-            }],
-            "quiet": True,
-            "no_warnings": True,
-        }
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        return output_path
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Ошибка скачивания: {str(e)}")
+        jobs[job_id]["status"] = "transcribing"
+        jobs[job_id]["message"] = "AI анализирует аудио..."
 
+        job_dir = TEMP_DIR / job_id
+        job_dir.mkdir(exist_ok=True)
 
-def audio_to_midi(audio_path: Path, midi_path: Path) -> Path:
-    """Транскрипция аудио → MIDI через Basic Pitch (Spotify)."""
-    try:
-        _, midi_data, _ = predict(str(audio_path))
+        midi_path = job_dir / "transcription.mid"
+        pdf_path = OUTPUT_DIR / f"{job_id}.pdf"
+
+        # Шаг 1: Audio → MIDI (Basic Pitch)
+        print(f"[{job_id}] Starting transcription...")
+        _, midi_data, _ = predict(str(input_path))
         midi_data.write(str(midi_path))
-        return midi_path
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка транскрипции: {str(e)}")
+        print(f"[{job_id}] MIDI created: {midi_path}")
 
+        jobs[job_id]["status"] = "generating_pdf"
+        jobs[job_id]["message"] = "Генерация нотного листа..."
 
-def midi_to_pdf(midi_path: Path, pdf_path: Path) -> Path:
-    """MIDI → PDF через MuseScore CLI или LilyPond (fallback)."""
-    try:
-        # Ищем MuseScore
-        mscore = shutil.which("mscore") or shutil.which("mscore4") or shutil.which("musescore") or shutil.which("musescore3")
-
+        # Шаг 2: MIDI → PDF
+        mscore = (
+            shutil.which("mscore") or 
+            shutil.which("mscore4") or 
+            shutil.which("musescore") or 
+            shutil.which("musescore3")
+        )
 
         if mscore:
             subprocess.run(
@@ -94,65 +86,48 @@ def midi_to_pdf(midi_path: Path, pdf_path: Path) -> Path:
                 timeout=60
             )
         else:
-            # Fallback: music21 + LilyPond
             s = converter.parse(str(midi_path))
             for part in s.parts:
                 part.insert(0, instrument.Piano())
             s = s.quantize()
             s.write("lily.pdf", fp=str(pdf_path))
 
-        return pdf_path
-    except subprocess.TimeoutExpired:
-        raise HTTPException(status_code=500, detail="Таймаут генерации PDF")
+        print(f"[{job_id}] PDF created: {pdf_path}")
+
+        # Очистка
+        try:
+            shutil.rmtree(job_dir)
+            os.remove(input_path)
+        except:
+            pass
+
+        jobs[job_id]["status"] = "completed"
+        jobs[job_id]["pdf_url"] = f"/download/{job_id}.pdf"
+        jobs[job_id]["message"] = "Готово!"
+
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Ошибка генерации PDF: {str(e)}")
-
-
-def process_audio(input_path: Path, job_id: str) -> dict:
-    """Полный пайплайн: аудио → MIDI → PDF."""
-    job_dir = TEMP_DIR / job_id
-    job_dir.mkdir(exist_ok=True)
-
-    midi_path = job_dir / "transcription.mid"
-    pdf_path = OUTPUT_DIR / f"{job_id}.pdf"
-
-    # Шаг 1: Audio → MIDI
-    audio_to_midi(input_path, midi_path)
-
-    # Шаг 2: MIDI → PDF
-    midi_to_pdf(midi_path, pdf_path)
-
-    # Очистка временных файлов
-    try:
-        shutil.rmtree(job_dir)
-    except:
-        pass
-
-    return {
-        "job_id": job_id,
-        "status": "completed",
-        "pdf_url": f"/download/{job_id}.pdf",
-        "midi_url": f"/download/{job_id}.mid",
-        "message": "Транскрипция завершена успешно"
-    }
+        print(f"[{job_id}] ERROR: {str(e)}")
+        jobs[job_id]["status"] = "error"
+        jobs[job_id]["message"] = str(e)
 
 
 @app.post("/transcribe/file")
-async def transcribe_file(file: UploadFile = File(...)):
+async def transcribe_file(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...)
+):
     """
-    Загрузка аудиофайла и транскрипция в ноты.
-    Поддерживаемые форматы: MP3, WAV, FLAC, M4A, OGG
+    Загрузка файла и запуск фоновой транскрипции.
+    Возвращает job_id для polling статуса.
     """
-    # Проверка размера
     content = await file.read()
     if len(content) > MAX_FILE_SIZE:
         raise HTTPException(status_code=413, detail="Файл слишком большой. Максимум 50 МБ.")
 
-    # Проверка формата
-    allowed = (".mp3", ".wav", ".flac", ".m4a", ".ogg", ".aac", ".wma")
+    allowed = (".mp3", ".wav", ".flac", ".m4a", ".ogg", ".aac")
     if not file.filename.lower().endswith(allowed):
         raise HTTPException(
-            status_code=400, 
+            status_code=400,
             detail=f"Неподдерживаемый формат. Разрешены: {', '.join(allowed)}"
         )
 
@@ -163,68 +138,63 @@ async def transcribe_file(file: UploadFile = File(...)):
     with open(input_path, "wb") as f:
         f.write(content)
 
-    return JSONResponse(content=process_audio(input_path, job_id))
+    # Сохраняем статус
+    jobs[job_id] = {
+        "job_id": job_id,
+        "status": "processing",
+        "message": "Файл загружен, начинаем обработку...",
+        "filename": file.filename
+    }
 
+    # Запускаем в фоновом потоке (чтобы не блокировать HTTP-ответ)
+    loop = asyncio.get_event_loop()
+    loop.run_in_executor(executor, process_audio_sync, job_id, input_path)
 
-@app.post("/transcribe/url")
-async def transcribe_url(url: str = Form(...)):
-    """
-    Транскрипция по ссылке (YouTube, SoundCloud, и др.)
-    """
-    job_id = str(uuid.uuid4())[:8]
-    input_path = TEMP_DIR / job_id / "audio.wav"
-    input_path.parent.mkdir(exist_ok=True)
-
-    download_audio(url, input_path)
-    return JSONResponse(content=process_audio(input_path, job_id))
-
-
-@app.get("/download/{filename}")
-async def download_file(filename: str):
-    """Скачивание сгенерированного PDF или MIDI."""
-    file_path = OUTPUT_DIR / filename
-    if not file_path.exists():
-        raise HTTPException(status_code=404, detail="Файл не найден или устарел")
-
-    media_type = "application/pdf" if filename.endswith(".pdf") else "audio/midi"
-    return FileResponse(
-        path=file_path,
-        filename=filename,
-        media_type=media_type
-    )
+    return JSONResponse(content={
+        "job_id": job_id,
+        "status": "processing",
+        "message": "Обработка начата. Используйте GET /jobs/{job_id} для проверки статуса."
+    })
 
 
 @app.get("/jobs/{job_id}")
 async def get_job_status(job_id: str):
     """Проверка статуса задания."""
-    pdf_path = OUTPUT_DIR / f"{job_id}.pdf"
-    if pdf_path.exists():
-        return {
-            "job_id": job_id,
-            "status": "completed",
-            "pdf_url": f"/download/{job_id}.pdf",
-        }
-    return {"job_id": job_id, "status": "processing"}
+    if job_id not in jobs:
+        raise HTTPException(status_code=404, detail="Задание не найдено")
+
+    return JSONResponse(content=jobs[job_id])
+
+
+@app.get("/download/{filename}")
+async def download_file(filename: str):
+    """Скачивание PDF."""
+    file_path = OUTPUT_DIR / filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Файл не найден")
+
+    return FileResponse(
+        path=file_path,
+        filename=filename,
+        media_type="application/pdf"
+    )
 
 
 @app.get("/health")
 async def health_check():
-    """Проверка работоспособности сервера."""
-    return {"status": "ok", "service": "PianoMagic API"}
+    return {"status": "ok", "service": "PianoMagic API v2"}
 
 
 @app.get("/")
 async def root():
     return {
-        "service": "PianoMagic API",
-        "version": "1.0.0",
+        "service": "PianoMagic API v2",
+        "version": "2.0.0",
         "endpoints": {
-            "upload": "POST /transcribe/file",
-            "url": "POST /transcribe/url",
-            "download": "GET /download/{filename}",
-            "health": "GET /health"
-        },
-        "docs": "/docs"
+            "upload": "POST /transcribe/file → возвращает job_id",
+            "status": "GET /jobs/{job_id}",
+            "download": "GET /download/{filename}"
+        }
     }
 
 
