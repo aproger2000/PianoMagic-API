@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="PianoMagic API", version="3.2.3")
+app = FastAPI(title="PianoMagic API", version="3.2.4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,17 +35,18 @@ jobs = {}
 BPM = 120
 SEC_PER_QUARTER = 60.0 / BPM
 GRID_8TH = 0.5
-MIN_AMP = 0.35
-MIN_DUR_SEC = 0.12
+MIN_AMP = 0.40
+MIN_DUR_SEC = 0.15
 MAX_DUR_QL = 4.0
 RIGHT_POLY_MAX = 4
 LEFT_POLY_MAX = 3
 MAX_KEY_SHARPS = 3
+MAX_CHORD_SPAN = 12  # макс 1 октава в аккорде
 
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "version": "3.2.3"}
+    return {"status": "ok", "version": "3.2.4"}
 
 
 @app.post("/transcribe/file")
@@ -93,14 +94,26 @@ async def download_pdf(job_id: str):
     )
 
 
+def limit_chord_span(notes, max_span):
+    """Удаляет крайние ноты, пока размах аккорда <= max_span полутонов.
+    Удаляет тишее из двух крайних."""
+    if len(notes) <= 1:
+        return notes
+    notes = sorted(notes, key=lambda x: x["pitch"])
+    while len(notes) > 1 and notes[-1]["pitch"] - notes[0]["pitch"] > max_span:
+        if notes[0]["velocity"] <= notes[-1]["velocity"]:
+            notes.pop(0)
+        else:
+            notes.pop()
+    return notes
+
+
 def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path):
     try:
-        logger.info(f"[{job_id}] === Начало v3.2.3 ===")
+        logger.info(f"[{job_id}] === Начало v3.2.4 ===")
 
         from basic_pitch.inference import predict
         from basic_pitch import ICASSP_2022_MODEL_PATH
-
-        logger.info(f"[{job_id}] Модель: {ICASSP_2022_MODEL_PATH}")
 
         _, _, note_events = predict(str(input_path))
         logger.info(f"[{job_id}] Найдено нот: {len(note_events)}")
@@ -159,9 +172,21 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
 
         logger.info(f"[{job_id}] Тональность: {detected_key.name} ({sharps} знаков)")
 
-        # 4. Разделение по рукам
-        right_notes = [n for n in notes_raw if n["pitch"] >= 60]
-        left_notes = [n for n in notes_raw if n["pitch"] < 60]
+        # 4. Разделение по рукам с адаптивной зоной пересечения
+        right_raw = []
+        left_raw = []
+        for n in notes_raw:
+            p = n["pitch"]
+            if p >= 60:  # C4 и выше → правая
+                right_raw.append(n)
+            elif p < 48:  # ниже C3 → левая
+                left_raw.append(n)
+            else:  # C3–B3 (48–59) → зона пересечения
+                # Назначаем руку, где меньше нот (балансировка)
+                if len(right_raw) <= len(left_raw):
+                    right_raw.append(n)
+                else:
+                    left_raw.append(n)
 
         # 5. Квантизация
         def quantize_ql(t):
@@ -188,6 +213,7 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
                 notes = slots[slot]
                 notes.sort(key=lambda x: x["velocity"], reverse=True)
 
+                # Уникальные pitch
                 seen = set()
                 unique = []
                 for note in notes:
@@ -196,6 +222,10 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
                         unique.append(note)
                 notes = unique[:poly_max]
 
+                # === ОГРАНИЧЕНИЕ ШИРИНЫ АККОРДА ===
+                notes = limit_chord_span(notes, MAX_CHORD_SPAN)
+
+                # Фильтр для левой руки
                 if not is_right:
                     pitches_sorted = sorted(notes, key=lambda x: x["pitch"])
                     skip = set()
@@ -213,20 +243,24 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
                     filtered = [pitches_sorted[i] for i in range(len(pitches_sorted)) if i not in skip]
                     notes = filtered[:poly_max]
 
+                    # M7 (11 полутонов) → октава
                     for n in notes:
                         for other in notes:
                             if n is not other and abs(n["pitch"] - other["pitch"]) == 11:
                                 if n["pitch"] < other["pitch"]:
                                     n["pitch"] += 12
 
+                    # Повторное ограничение ширины после транспозиции
+                    notes = limit_chord_span(notes, MAX_CHORD_SPAN)
+
                 result.extend(notes)
             return result
 
-        right_events = prepare_hand(right_notes, RIGHT_POLY_MAX, True)
-        left_events = prepare_hand(left_notes, LEFT_POLY_MAX, False)
+        right_events = prepare_hand(right_raw, RIGHT_POLY_MAX, True)
+        left_events = prepare_hand(left_raw, LEFT_POLY_MAX, False)
         logger.info(f"[{job_id}] Правая: {len(right_events)}, Левая: {len(left_events)}")
 
-        # 6. Создание партий — ноты разбиваются по тактам, offset строго < 4.0
+        # 6. Создание партий
         def build_part(events, is_right):
             part = stream.Part()
             part.insert(0, instrument.Piano())
@@ -238,7 +272,6 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
 
             events.sort(key=lambda x: x["q_start"])
 
-            # Разбиваем события по тактам
             measures = defaultdict(list)
             for evt in events:
                 start_ql = evt["q_start"]
@@ -249,7 +282,6 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
                 m_idx = int(start_ql // 4.0)
                 m_offset = start_ql % 4.0
 
-                # Если offset из-за округления стал 4.0 — переносим в следующий такт
                 if m_offset >= 3.999:
                     m_idx += 1
                     m_offset = 0.0
@@ -261,7 +293,6 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
                 while remaining > 0.001 and current_m < 500:
                     space = 4.0 - current_off
                     chunk = min(remaining, space)
-                    # Округляем chunk до сетки
                     chunk = round(chunk / GRID_8TH) * GRID_8TH
                     chunk = max(GRID_8TH, chunk)
 
@@ -277,7 +308,6 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
                     current_m += 1
                     current_off = 0.0
 
-            # Собираем такты
             for m_idx in sorted(measures.keys()):
                 measure = stream.Measure(number=m_idx + 1)
                 slot_notes = measures[m_idx]
@@ -292,7 +322,6 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
                     pitch = nd["pitch"]
                     vel = nd["velocity"]
 
-                    # Пауза
                     gap = offset - last_end
                     if gap >= GRID_8TH:
                         rest_ql = round(gap / GRID_8TH) * GRID_8TH
@@ -303,7 +332,6 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
                             measure.insert(last_end, r)
                             last_end += rest_ql
 
-                    # Нота — не вставляем, если не влезает
                     dur = min(dur, 4.0 - offset)
                     if dur < GRID_8TH or offset >= 4.0:
                         continue
@@ -317,7 +345,6 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
                     if dur <= 0.5:
                         n.articulations.append(articulations.Staccato())
 
-                    # Лига
                     if pitch in prev_notes:
                         prev = prev_notes[pitch]
                         if prev.offset + prev.duration.quarterLength >= offset - 0.01:
