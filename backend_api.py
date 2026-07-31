@@ -10,7 +10,6 @@ from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="PianoMagic API", version="3.0.0")
 
-# CORS для GitHub Pages и локальной разработки
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -27,7 +26,6 @@ app.add_middleware(
 JOBS_DIR = Path("/tmp/pianomagic_jobs")
 JOBS_DIR.mkdir(exist_ok=True)
 
-# job_id -> {status, pdf_path, error}
 jobs = {}
 
 
@@ -76,12 +74,13 @@ async def download_pdf(job_id: str):
 
 def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path):
     try:
-        # 1. Basic Pitch (TFLite) -> MIDI
+        # ========== 1. Basic Pitch (TFLite) -> MIDI ==========
+        # Импорт внутри функции, чтобы сервер стартовал даже при проблемах с зависимостями
         from basic_pitch.inference import predict_and_save
 
         predict_and_save(
-            [str(input_path)],
-            str(midi_path.parent),
+            audio_path_list=[str(input_path)],
+            output_directory=str(midi_path.parent),
             save_midi=True,
             sonify_midi=False,
             save_model_outputs=False,
@@ -97,8 +96,8 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
             else:
                 raise FileNotFoundError("Basic Pitch не создал MIDI-файл")
 
-        # 2. Пост-обработка music21: разделение рук + квантизация
-        from music21 import converter, stream, instrument, clef, note as m21_note, chord as m21_chord
+        # ========== 2. Пост-обработка music21 ==========
+        from music21 import converter, stream, instrument, clef, note as m21_note, chord as m21_chord, duration
 
         score = converter.parse(str(bp_output))
 
@@ -119,7 +118,6 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
 
         right_hand = stream.Part()
         right_hand.insert(0, instrument.Piano())
-        # скрипичный ключ по умолчанию
 
         left_hand = stream.Part()
         left_hand.insert(0, instrument.Piano())
@@ -133,7 +131,7 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
         new_score.insert(0, right_hand)
         new_score.insert(0, left_hand)
 
-        # Квантизация до 1/16 и триолей
+        # Квантизация до 1/16
         try:
             new_score = new_score.quantize(quarterLengthDivisors=[4, 3], inPlace=False)
         except Exception:
@@ -141,7 +139,7 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
 
         new_score.write("midi", str(midi_path))
 
-        # 3. MuseScore3 (headless) -> PDF
+        # ========== 3. MuseScore3 -> PDF ==========
         result = subprocess.run(
             ["musescore3", "-o", str(pdf_path), str(midi_path)],
             capture_output=True,
@@ -157,7 +155,7 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
         jobs[job_id]["status"] = "failed"
         jobs[job_id]["error"] = str(e)
     finally:
-        # Очистка входного файла и промежуточного MIDI
+        # Очистка
         if input_path.exists():
             input_path.unlink()
         bp_cleanup = midi_path.parent / f"{input_path.stem}_basic_pitch.mid"
