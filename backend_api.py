@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="PianoMagic API", version="3.2.0")
+app = FastAPI(title="PianoMagic API", version="3.2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -32,13 +32,12 @@ JOBS_DIR = Path("/tmp/pianomagic_jobs")
 JOBS_DIR.mkdir(exist_ok=True)
 jobs = {}
 
-# ====== Константы ТЗ ======
 BPM = 120
 SEC_PER_QUARTER = 60.0 / BPM
-GRID_8TH = 0.5  # quarterLength восьмой
+GRID_8TH = 0.5
 MIN_AMP = 0.30
 MIN_DUR_SEC = 0.10
-MAX_DUR_QL = 4.0  # целая нота
+MAX_DUR_QL = 4.0
 RIGHT_POLY_MAX = 4
 LEFT_POLY_MAX = 3
 MAX_KEY_SHARPS = 3
@@ -46,7 +45,7 @@ MAX_KEY_SHARPS = 3
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "version": "3.2.0"}
+    return {"status": "ok", "version": "3.2.1"}
 
 
 @app.post("/transcribe/file")
@@ -92,20 +91,27 @@ async def download_pdf(job_id: str):
 
 def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path):
     try:
-        logger.info(f"[{job_id}] Начало обработки v3.2.0...")
-        from basic_pitch.inference import predict
-        from music21 import (
-            stream, instrument, clef, note as m21_note, chord as m21_chord,
-            tempo, meter, key, duration as m21_duration, articulations,
-            tie, pitch as m21_pitch
-        )
+        logger.info(f"[{job_id}] === Начало v3.2.1 ===")
 
-        # 1. Basic Pitch -> note_events
+        from basic_pitch.inference import predict
+        from basic_pitch import ICASSP_2022_MODEL_PATH
+
+        logger.info(f"[{job_id}] Модель путь: {ICASSP_2022_MODEL_PATH}")
+        logger.info(f"[{job_id}] Модель существует: {Path(ICASSP_2022_MODEL_PATH).exists()}")
+
+        logger.info(f"[{job_id}] Запуск Basic Pitch...")
         _, _, note_events = predict(str(input_path))
         logger.info(f"[{job_id}] Найдено нот: {len(note_events)}")
 
         if not note_events:
             raise ValueError("Ноты не найдены")
+
+        # === Импорт music21 ===
+        from music21 import (
+            stream, instrument, clef, note as m21_note, chord as m21_chord,
+            tempo, meter, key, duration as m21_duration, articulations,
+            tie, pitch as m21_pitch
+        )
 
         # 2. Фильтрация и нормализация
         notes_raw = []
@@ -114,7 +120,6 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
             if amp < MIN_AMP or dur < MIN_DUR_SEC:
                 continue
             p = int(pitch_val)
-            # Ограничение диапазона C1-C7 (24-96), перенос октав
             while p < 24:
                 p += 12
             while p > 96:
@@ -130,8 +135,9 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
             raise ValueError("После фильтрации нот не осталось")
 
         avg_vel = sum(n["velocity"] for n in notes_raw) / len(notes_raw)
+        logger.info(f"[{job_id}] После фильтрации: {len(notes_raw)}, avg_vel={avg_vel:.1f}")
 
-        # 3. Определение тональности (Krumhansl-Schmuckler)
+        # 3. Определение тональности
         try:
             from music21.analysis import discrete
             s_tmp = stream.Stream()
@@ -139,31 +145,22 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
                 s_tmp.append(m21_note.Note(midi=n["pitch"], quarterLength=0.5))
             analyzer = discrete.KrumhanslSchmuckler()
             detected_key = analyzer.getSolution(s_tmp)
-        except Exception:
+        except Exception as e:
+            logger.warning(f"[{job_id}] Krumhansl failed: {e}")
             detected_key = key.Key("C")
 
         sharps = detected_key.sharps
         if abs(sharps) > MAX_KEY_SHARPS:
             candidates = [0, 1, 2, 3, -1, -2, -3]
             best = min(candidates, key=lambda c: abs(c - sharps))
-            # Создаём ключ по количеству знаков
-            if best >= 0:
-                detected_key = key.Key(m21_pitch.Pitch(sharps=best).name)
-            else:
-                detected_key = key.Key(m21_pitch.Pitch(sharps=best).name)
+            detected_key = key.Key(m21_pitch.Pitch(sharps=best).name)
             sharps = best
 
         logger.info(f"[{job_id}] Тональность: {detected_key.name} ({sharps} знаков)")
 
         # 4. Разделение по рукам
-        right_notes = []
-        left_notes = []
-        for n in notes_raw:
-            p = n["pitch"]
-            if p >= 60:
-                right_notes.append(n)
-            else:
-                left_notes.append(n)
+        right_notes = [n for n in notes_raw if n["pitch"] >= 60]
+        left_notes = [n for n in notes_raw if n["pitch"] < 60]
 
         # 5. Квантизация и подготовка
         def quantize_ql(t):
@@ -180,7 +177,6 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
                 qdur = min(MAX_DUR_QL, qdur)
                 quantized.append({**n, "q_start": qs, "q_dur": qdur})
 
-            # Группировка по слотам
             slots = defaultdict(list)
             for n in quantized:
                 slot = round(n["q_start"] / GRID_8TH) * GRID_8TH
@@ -191,7 +187,6 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
                 notes = slots[slot]
                 notes.sort(key=lambda x: x["velocity"], reverse=True)
 
-                # Уникальные pitch
                 seen = set()
                 unique = []
                 for note in notes:
@@ -200,7 +195,6 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
                         unique.append(note)
                 notes = unique[:poly_max]
 
-                # Фильтр интервалов для левой руки
                 if not is_right:
                     pitches_sorted = sorted(notes, key=lambda x: x["pitch"])
                     skip = set()
@@ -218,7 +212,6 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
                     filtered = [pitches_sorted[i] for i in range(len(pitches_sorted)) if i not in skip]
                     notes = filtered[:poly_max]
 
-                    # M7 (11 полутонов) -> октавный дубль
                     for n in notes:
                         for other in notes:
                             if n is not other and abs(n["pitch"] - other["pitch"]) == 11:
@@ -230,7 +223,6 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
 
         right_events = prepare_hand(right_notes, RIGHT_POLY_MAX, True)
         left_events = prepare_hand(left_notes, LEFT_POLY_MAX, False)
-
         logger.info(f"[{job_id}] Правая: {len(right_events)}, Левая: {len(left_events)}")
 
         # 6. Создание тактов 4/4
@@ -244,10 +236,9 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
                 part.insert(0, clef.BassClef())
 
             events.sort(key=lambda x: x["q_start"])
-
             measure_idx = -1
             measure = None
-            prev_notes = {}  # pitch -> note object for tie
+            prev_notes = {}
             last_end = 0.0
 
             for evt in events:
@@ -267,7 +258,6 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
                     last_end = 0.0
                     prev_notes = {}
 
-                # Пауза?
                 gap = m_offset - last_end
                 if gap >= GRID_8TH:
                     rest_ql = round(gap / GRID_8TH) * GRID_8TH
@@ -278,7 +268,6 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
                         measure.insert(last_end, r)
                         last_end += rest_ql
 
-                # Нота
                 dur = min(dur_ql, 4.0 - m_offset)
                 if dur < GRID_8TH:
                     continue
@@ -287,14 +276,11 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
                 n.duration = m21_duration.Duration(quarterLength=dur)
                 n.volume.velocity = vel
 
-                # Акцент
                 if vel > avg_vel * 1.3:
                     n.articulations.append(articulations.Accent())
-                # Стаккато для коротких
                 if dur <= 0.5:
                     n.articulations.append(articulations.Staccato())
 
-                # Лига
                 if pitch in prev_notes:
                     prev = prev_notes[pitch]
                     if prev.offset + prev.duration.quarterLength >= m_offset - 0.01:
@@ -321,7 +307,6 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
         score.write("midi", str(midi_path))
         logger.info(f"[{job_id}] MIDI записан")
 
-        # 7. MuseScore -> PDF
         result = subprocess.run(
             ["musescore3", "-o", str(pdf_path), str(midi_path)],
             capture_output=True,
