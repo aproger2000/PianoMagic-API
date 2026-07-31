@@ -4,7 +4,6 @@ import shutil
 import subprocess
 import logging
 from pathlib import Path
-from collections import defaultdict
 
 from fastapi import FastAPI, File, UploadFile, BackgroundTasks, HTTPException
 from fastapi.responses import FileResponse
@@ -13,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="PianoMagic API", version="3.2.4")
+app = FastAPI(title="PianoMagic API", version="3.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,18 +34,12 @@ jobs = {}
 BPM = 120
 SEC_PER_QUARTER = 60.0 / BPM
 GRID_8TH = 0.5
-MIN_AMP = 0.40
-MIN_DUR_SEC = 0.15
-MAX_DUR_QL = 4.0
-RIGHT_POLY_MAX = 4
-LEFT_POLY_MAX = 3
-MAX_KEY_SHARPS = 3
-MAX_CHORD_SPAN = 12  # макс 1 октава в аккорде
+MIN_AMP = 0.25
 
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "version": "3.2.4"}
+    return {"status": "ok", "version": "3.3.0"}
 
 
 @app.post("/transcribe/file")
@@ -94,282 +87,189 @@ async def download_pdf(job_id: str):
     )
 
 
-def limit_chord_span(notes, max_span):
-    """Удаляет крайние ноты, пока размах аккорда <= max_span полутонов.
-    Удаляет тишее из двух крайних."""
-    if len(notes) <= 1:
-        return notes
-    notes = sorted(notes, key=lambda x: x["pitch"])
-    while len(notes) > 1 and notes[-1]["pitch"] - notes[0]["pitch"] > max_span:
-        if notes[0]["velocity"] <= notes[-1]["velocity"]:
-            notes.pop(0)
-        else:
-            notes.pop()
-    return notes
-
-
 def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path):
     try:
-        logger.info(f"[{job_id}] === Начало v3.2.4 ===")
+        logger.info(f"[{job_id}] === Начало v3.3.0 (мелодия) ===")
 
         from basic_pitch.inference import predict
-        from basic_pitch import ICASSP_2022_MODEL_PATH
+        from music21 import (
+            stream, instrument, note as m21_note,
+            tempo, meter, key, duration as m21_duration,
+            tie, pitch as m21_pitch, articulations
+        )
 
+        # 1. Basic Pitch -> note_events
         _, _, note_events = predict(str(input_path))
-        logger.info(f"[{job_id}] Найдено нот: {len(note_events)}")
+        logger.info(f"[{job_id}] Всего нот: {len(note_events)}")
 
         if not note_events:
             raise ValueError("Ноты не найдены")
 
-        from music21 import (
-            stream, instrument, clef, note as m21_note, chord as m21_chord,
-            tempo, meter, key, duration as m21_duration, articulations,
-            tie, pitch as m21_pitch
-        )
-
-        # 2. Фильтрация
-        notes_raw = []
-        for start, end, pitch_val, amp, _ in note_events:
-            dur = end - start
-            if amp < MIN_AMP or dur < MIN_DUR_SEC:
+        # 2. Фильтрация по громкости
+        notes = []
+        for start, end, pitch, amp, _ in note_events:
+            if amp < MIN_AMP:
                 continue
-            p = int(pitch_val)
-            while p < 24:
-                p += 12
-            while p > 96:
-                p -= 12
-            notes_raw.append({
-                "start": start,
-                "end": end,
-                "pitch": p,
+            notes.append({
+                "start": float(start),
+                "end": float(end),
+                "pitch": int(pitch),
                 "velocity": min(127, int(amp * 127)),
             })
 
-        if not notes_raw:
+        if not notes:
             raise ValueError("После фильтрации нот не осталось")
 
-        avg_vel = sum(n["velocity"] for n in notes_raw) / len(notes_raw)
-        logger.info(f"[{job_id}] После фильтрации: {len(notes_raw)}, avg_vel={avg_vel:.1f}")
+        # 3. === ИЗВЛЕЧЕНИЕ ТОЛЬКО МЕЛОДИИ (верхний голос) ===
+        # Разбиваем timeline на слоты по 0.1 сек, в каждом оставляем только верхнюю ноту
+        TIME_RES = 0.1
+        timeline = {}
 
-        # 3. Тональность
+        for n in notes:
+            t = n["start"]
+            while t < n["end"]:
+                slot = round(t / TIME_RES) * TIME_RES
+                if slot not in timeline or n["pitch"] > timeline[slot]["pitch"]:
+                    timeline[slot] = n
+                t += TIME_RES
+
+        # Сортируем по времени, убираем дубли подряд
+        slots = sorted(timeline.keys())
+        melody = []
+        for slot in slots:
+            n = timeline[slot]
+            if not melody or n["pitch"] != melody[-1]["pitch"]:
+                melody.append({
+                    "start": slot,
+                    "pitch": n["pitch"],
+                    "velocity": n["velocity"],
+                })
+            else:
+                # Продолжаем предыдущую ноту
+                pass
+
+        # Вычисляем длительности (end = start следующей ноты или +0.5)
+        for i in range(len(melody)):
+            if i + 1 < len(melody):
+                melody[i]["dur"] = melody[i + 1]["start"] - melody[i]["start"]
+            else:
+                melody[i]["dur"] = 0.5  # последняя нота
+
+        # Убираем слишком короткие
+        melody = [m for m in melody if m["dur"] >= 0.08]
+
+        logger.info(f"[{job_id}] Мелодия: {len(melody)} нот")
+
+        if not melody:
+            raise ValueError("Мелодия не выделена")
+
+        # 4. Тональность
         try:
             from music21.analysis import discrete
             s_tmp = stream.Stream()
-            for n in notes_raw:
-                s_tmp.append(m21_note.Note(midi=n["pitch"], quarterLength=0.5))
+            for m in melody:
+                s_tmp.append(m21_note.Note(midi=m["pitch"], quarterLength=0.5))
             analyzer = discrete.KrumhanslSchmuckler()
             detected_key = analyzer.getSolution(s_tmp)
-        except Exception as e:
-            logger.warning(f"[{job_id}] Krumhansl failed: {e}")
+        except Exception:
             detected_key = key.Key("C")
 
         sharps = detected_key.sharps
-        if abs(sharps) > MAX_KEY_SHARPS:
+        if abs(sharps) > 3:
             candidates = [0, 1, 2, 3, -1, -2, -3]
             best = min(candidates, key=lambda c: abs(c - sharps))
             detected_key = key.Key(m21_pitch.Pitch(sharps=best).name)
-            sharps = best
 
-        logger.info(f"[{job_id}] Тональность: {detected_key.name} ({sharps} знаков)")
+        logger.info(f"[{job_id}] Тональность: {detected_key.name}")
 
-        # 4. Разделение по рукам с адаптивной зоной пересечения
-        right_raw = []
-        left_raw = []
-        for n in notes_raw:
-            p = n["pitch"]
-            if p >= 60:  # C4 и выше → правая
-                right_raw.append(n)
-            elif p < 48:  # ниже C3 → левая
-                left_raw.append(n)
-            else:  # C3–B3 (48–59) → зона пересечения
-                # Назначаем руку, где меньше нот (балансировка)
-                if len(right_raw) <= len(left_raw):
-                    right_raw.append(n)
-                else:
-                    left_raw.append(n)
-
-        # 5. Квантизация
-        def quantize_ql(t):
+        # 5. Квантизация до 1/8
+        def quantize(t):
             ql = t / SEC_PER_QUARTER
-            q = round(ql / GRID_8TH) * GRID_8TH
-            return max(0.0, q)
+            return round(ql / GRID_8TH) * GRID_8TH
 
-        def prepare_hand(raw, poly_max, is_right):
-            quantized = []
-            for n in raw:
-                qs = quantize_ql(n["start"])
-                qe = quantize_ql(n["end"])
-                qdur = max(GRID_8TH, round((qe - qs) / GRID_8TH) * GRID_8TH)
-                qdur = min(MAX_DUR_QL, qdur)
-                quantized.append({**n, "q_start": qs, "q_dur": qdur})
+        quantized = []
+        for m in melody:
+            qs = quantize(m["start"])
+            qdur = max(GRID_8TH, round(m["dur"] / SEC_PER_QUARTER / GRID_8TH) * GRID_8TH)
+            qdur = min(4.0, qdur)
+            quantized.append({
+                "start": qs,
+                "dur": qdur,
+                "pitch": m["pitch"],
+                "velocity": m["velocity"],
+            })
 
-            slots = defaultdict(list)
-            for n in quantized:
-                slot = round(n["q_start"] / GRID_8TH) * GRID_8TH
-                slots[slot].append(n)
-
-            result = []
-            for slot in sorted(slots.keys()):
-                notes = slots[slot]
-                notes.sort(key=lambda x: x["velocity"], reverse=True)
-
-                # Уникальные pitch
-                seen = set()
-                unique = []
-                for note in notes:
-                    if note["pitch"] not in seen:
-                        seen.add(note["pitch"])
-                        unique.append(note)
-                notes = unique[:poly_max]
-
-                # === ОГРАНИЧЕНИЕ ШИРИНЫ АККОРДА ===
-                notes = limit_chord_span(notes, MAX_CHORD_SPAN)
-
-                # Фильтр для левой руки
-                if not is_right:
-                    pitches_sorted = sorted(notes, key=lambda x: x["pitch"])
-                    skip = set()
-                    for i, a in enumerate(pitches_sorted):
-                        if i in skip:
-                            continue
-                        for j, b in enumerate(pitches_sorted):
-                            if i >= j or j in skip:
-                                continue
-                            if abs(a["pitch"] - b["pitch"]) == 1:
-                                if a["velocity"] < b["velocity"]:
-                                    skip.add(i)
-                                else:
-                                    skip.add(j)
-                    filtered = [pitches_sorted[i] for i in range(len(pitches_sorted)) if i not in skip]
-                    notes = filtered[:poly_max]
-
-                    # M7 (11 полутонов) → октава
-                    for n in notes:
-                        for other in notes:
-                            if n is not other and abs(n["pitch"] - other["pitch"]) == 11:
-                                if n["pitch"] < other["pitch"]:
-                                    n["pitch"] += 12
-
-                    # Повторное ограничение ширины после транспозиции
-                    notes = limit_chord_span(notes, MAX_CHORD_SPAN)
-
-                result.extend(notes)
-            return result
-
-        right_events = prepare_hand(right_raw, RIGHT_POLY_MAX, True)
-        left_events = prepare_hand(left_raw, LEFT_POLY_MAX, False)
-        logger.info(f"[{job_id}] Правая: {len(right_events)}, Левая: {len(left_events)}")
-
-        # 6. Создание партий
-        def build_part(events, is_right):
-            part = stream.Part()
-            part.insert(0, instrument.Piano())
-            part.insert(0, detected_key)
-            part.insert(0, meter.TimeSignature("4/4"))
-            part.insert(0, tempo.MetronomeMark(number=BPM))
-            if not is_right:
-                part.insert(0, clef.BassClef())
-
-            events.sort(key=lambda x: x["q_start"])
-
-            measures = defaultdict(list)
-            for evt in events:
-                start_ql = evt["q_start"]
-                dur_ql = evt["q_dur"]
-                pitch = evt["pitch"]
-                vel = evt["velocity"]
-
-                m_idx = int(start_ql // 4.0)
-                m_offset = start_ql % 4.0
-
-                if m_offset >= 3.999:
-                    m_idx += 1
-                    m_offset = 0.0
-
-                remaining = dur_ql
-                current_m = m_idx
-                current_off = m_offset
-
-                while remaining > 0.001 and current_m < 500:
-                    space = 4.0 - current_off
-                    chunk = min(remaining, space)
-                    chunk = round(chunk / GRID_8TH) * GRID_8TH
-                    chunk = max(GRID_8TH, chunk)
-
-                    if chunk >= GRID_8TH and current_off < 4.0:
-                        measures[current_m].append({
-                            "offset": current_off,
-                            "dur": chunk,
-                            "pitch": pitch,
-                            "velocity": vel,
-                        })
-
-                    remaining -= chunk
-                    current_m += 1
-                    current_off = 0.0
-
-            for m_idx in sorted(measures.keys()):
-                measure = stream.Measure(number=m_idx + 1)
-                slot_notes = measures[m_idx]
-                slot_notes.sort(key=lambda x: x["offset"])
-
-                last_end = 0.0
-                prev_notes = {}
-
-                for nd in slot_notes:
-                    offset = nd["offset"]
-                    dur = nd["dur"]
-                    pitch = nd["pitch"]
-                    vel = nd["velocity"]
-
-                    gap = offset - last_end
-                    if gap >= GRID_8TH:
-                        rest_ql = round(gap / GRID_8TH) * GRID_8TH
-                        rest_ql = min(rest_ql, 4.0 - last_end)
-                        if rest_ql >= GRID_8TH:
-                            r = m21_note.Rest()
-                            r.duration = m21_duration.Duration(quarterLength=rest_ql)
-                            measure.insert(last_end, r)
-                            last_end += rest_ql
-
-                    dur = min(dur, 4.0 - offset)
-                    if dur < GRID_8TH or offset >= 4.0:
-                        continue
-
-                    n = m21_note.Note(midi=pitch)
-                    n.duration = m21_duration.Duration(quarterLength=dur)
-                    n.volume.velocity = vel
-
-                    if vel > avg_vel * 1.3:
-                        n.articulations.append(articulations.Accent())
-                    if dur <= 0.5:
-                        n.articulations.append(articulations.Staccato())
-
-                    if pitch in prev_notes:
-                        prev = prev_notes[pitch]
-                        if prev.offset + prev.duration.quarterLength >= offset - 0.01:
-                            prev.tie = tie.Tie("start")
-                            n.tie = tie.Tie("stop")
-
-                    measure.insert(offset, n)
-                    prev_notes[pitch] = n
-                    last_end = max(last_end, offset + dur)
-
-                part.append(measure)
-
-            try:
-                part.makeBeams(inPlace=True)
-            except Exception as e:
-                logger.warning(f"[{job_id}] makeBeams пропущен: {e}")
-            return part
-
-        right_part = build_part(right_events, True)
-        left_part = build_part(left_events, False)
-
+        # 6. Создание нотного текста — только одна линия (скрипичный ключ)
         score = stream.Score()
-        score.insert(0, right_part)
-        score.insert(0, left_part)
+        part = stream.Part()
+        part.insert(0, instrument.Piano())
+        part.insert(0, detected_key)
+        part.insert(0, meter.TimeSignature("4/4"))
+        part.insert(0, tempo.MetronomeMark(number=BPM))
 
+        measures = {}
+        for n in quantized:
+            m_idx = int(n["start"] // 4.0)
+            off = n["start"] % 4.0
+            if off >= 3.999:
+                m_idx += 1
+                off = 0.0
+            if m_idx not in measures:
+                measures[m_idx] = []
+            measures[m_idx].append(n)
+
+        avg_vel = sum(m["velocity"] for m in quantized) / len(quantized)
+
+        for m_idx in sorted(measures.keys()):
+            measure = stream.Measure(number=m_idx + 1)
+            notes_list = sorted(measures[m_idx], key=lambda x: x["start"])
+
+            last_end = 0.0
+            prev_note = None
+
+            for nd in notes_list:
+                off = nd["start"] % 4.0
+                dur = min(nd["dur"], 4.0 - off)
+                if dur < GRID_8TH:
+                    continue
+
+                # Пауза
+                gap = off - last_end
+                if gap >= GRID_8TH:
+                    r = m21_note.Rest()
+                    r.duration = m21_duration.Duration(quarterLength=round(gap / GRID_8TH) * GRID_8TH)
+                    measure.insert(last_end, r)
+                    last_end += r.duration.quarterLength
+
+                # Нота
+                n = m21_note.Note(midi=nd["pitch"])
+                n.duration = m21_duration.Duration(quarterLength=dur)
+                n.volume.velocity = nd["velocity"]
+
+                # Лига между одинаковыми нотами
+                if prev_note and prev_note.pitch.midi == nd["pitch"]:
+                    if prev_note.offset + prev_note.duration.quarterLength >= off - 0.01:
+                        prev_note.tie = tie.Tie("start")
+                        n.tie = tie.Tie("stop")
+
+                # Акцент
+                if nd["velocity"] > avg_vel * 1.3:
+                    n.articulations.append(articulations.Accent())
+
+                measure.insert(off, n)
+                prev_note = n
+                last_end = off + dur
+
+            part.append(measure)
+
+        try:
+            part.makeBeams(inPlace=True)
+        except Exception:
+            pass
+
+        score.insert(0, part)
+
+        # 7. Сохранение
         score.write("midi", str(midi_path))
         logger.info(f"[{job_id}] MIDI записан")
 
