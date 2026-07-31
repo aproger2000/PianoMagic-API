@@ -2,13 +2,17 @@ import os
 import uuid
 import shutil
 import subprocess
+import logging
 from pathlib import Path
 
 from fastapi import FastAPI, File, UploadFile, BackgroundTasks, HTTPException
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="PianoMagic API", version="3.0.0")
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="PianoMagic API", version="3.0.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -31,7 +35,7 @@ jobs = {}
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "version": "3.0.0"}
+    return {"status": "ok", "version": "3.0.1"}
 
 
 @app.post("/transcribe/file")
@@ -79,8 +83,20 @@ async def download_pdf(job_id: str):
 
 def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path):
     try:
+        logger.info(f"[{job_id}] Начало обработки...")
+
         # ========== 1. Basic Pitch (ONNX) -> MIDI ==========
         from basic_pitch.inference import predict_and_save
+        from basic_pitch import ICASSP_2022_MODEL_PATH
+
+        # Явно указываем путь к ONNX-модели, чтобы не грузить TensorFlow
+        onnx_model_path = Path(ICASSP_2022_MODEL_PATH).with_suffix(".onnx")
+        if not onnx_model_path.exists():
+            onnx_model_path = Path(ICASSP_2022_MODEL_PATH).parent / "nmp.onnx"
+        
+        logger.info(f"[{job_id}] ONNX модель: {onnx_model_path}")
+        if not onnx_model_path.exists():
+            raise FileNotFoundError(f"ONNX модель не найдена: {onnx_model_path}")
 
         predict_and_save(
             audio_path_list=[str(input_path)],
@@ -89,8 +105,10 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
             sonify_midi=False,
             save_model_outputs=False,
             save_notes=False,
+            model_path=str(onnx_model_path),
         )
 
+        # Basic Pitch сохраняет файл как {input_name}_basic_pitch.mid
         bp_output = midi_path.parent / f"{input_path.stem}_basic_pitch.mid"
         if not bp_output.exists():
             candidates = list(midi_path.parent.glob("*_basic_pitch.mid"))
@@ -98,6 +116,8 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
                 bp_output = candidates[0]
             else:
                 raise FileNotFoundError("Basic Pitch не создал MIDI-файл")
+
+        logger.info(f"[{job_id}] MIDI создан: {bp_output}")
 
         # ========== 2. Пост-обработка music21 ==========
         from music21 import converter, stream, instrument, clef, note as m21_note, chord as m21_chord
@@ -136,10 +156,11 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
 
         try:
             new_score = new_score.quantize(quarterLengthDivisors=[4, 3], inPlace=False)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"[{job_id}] Квантизация пропущена: {e}")
 
         new_score.write("midi", str(midi_path))
+        logger.info(f"[{job_id}] Пост-обработка завершена")
 
         # ========== 3. MuseScore3 -> PDF ==========
         result = subprocess.run(
@@ -151,9 +172,11 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
         if result.returncode != 0:
             raise RuntimeError(f"MuseScore3 error: {result.stderr}")
 
+        logger.info(f"[{job_id}] PDF создан: {pdf_path}")
         jobs[job_id]["status"] = "completed"
 
     except Exception as e:
+        logger.error(f"[{job_id}] Ошибка: {e}", exc_info=True)
         jobs[job_id]["status"] = "failed"
         jobs[job_id]["error"] = str(e)
     finally:
