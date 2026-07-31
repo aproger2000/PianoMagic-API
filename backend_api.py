@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="PianoMagic API", version="3.2.1")
+app = FastAPI(title="PianoMagic API", version="3.2.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -45,7 +45,7 @@ MAX_KEY_SHARPS = 3
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "version": "3.2.1"}
+    return {"status": "ok", "version": "3.2.2"}
 
 
 @app.post("/transcribe/file")
@@ -72,7 +72,11 @@ async def transcribe_file(background_tasks: BackgroundTasks, file: UploadFile = 
 async def get_status(job_id: str):
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    return {"job_id": job_id, "status": jobs[job_id]["status"]}
+    return {
+        "job_id": job_id,
+        "status": jobs[job_id]["status"],
+        "error": jobs[job_id].get("error"),
+    }
 
 
 @app.get("/download/{job_id}.pdf")
@@ -91,29 +95,27 @@ async def download_pdf(job_id: str):
 
 def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path):
     try:
-        logger.info(f"[{job_id}] === Начало v3.2.1 ===")
+        logger.info(f"[{job_id}] === Начало v3.2.2 ===")
 
         from basic_pitch.inference import predict
         from basic_pitch import ICASSP_2022_MODEL_PATH
 
-        logger.info(f"[{job_id}] Модель путь: {ICASSP_2022_MODEL_PATH}")
+        logger.info(f"[{job_id}] Модель: {ICASSP_2022_MODEL_PATH}")
         logger.info(f"[{job_id}] Модель существует: {Path(ICASSP_2022_MODEL_PATH).exists()}")
 
-        logger.info(f"[{job_id}] Запуск Basic Pitch...")
         _, _, note_events = predict(str(input_path))
         logger.info(f"[{job_id}] Найдено нот: {len(note_events)}")
 
         if not note_events:
             raise ValueError("Ноты не найдены")
 
-        # === Импорт music21 ===
         from music21 import (
             stream, instrument, clef, note as m21_note, chord as m21_chord,
             tempo, meter, key, duration as m21_duration, articulations,
             tie, pitch as m21_pitch
         )
 
-        # 2. Фильтрация и нормализация
+        # 2. Фильтрация
         notes_raw = []
         for start, end, pitch_val, amp, _ in note_events:
             dur = end - start
@@ -137,7 +139,7 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
         avg_vel = sum(n["velocity"] for n in notes_raw) / len(notes_raw)
         logger.info(f"[{job_id}] После фильтрации: {len(notes_raw)}, avg_vel={avg_vel:.1f}")
 
-        # 3. Определение тональности
+        # 3. Тональность
         try:
             from music21.analysis import discrete
             s_tmp = stream.Stream()
@@ -162,7 +164,7 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
         right_notes = [n for n in notes_raw if n["pitch"] >= 60]
         left_notes = [n for n in notes_raw if n["pitch"] < 60]
 
-        # 5. Квантизация и подготовка
+        # 5. Квантизация
         def quantize_ql(t):
             ql = t / SEC_PER_QUARTER
             q = round(ql / GRID_8TH) * GRID_8TH
@@ -225,7 +227,7 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
         left_events = prepare_hand(left_notes, LEFT_POLY_MAX, False)
         logger.info(f"[{job_id}] Правая: {len(right_events)}, Левая: {len(left_events)}")
 
-        # 6. Создание тактов 4/4
+        # 6. Создание партий — ИСПРАВЛЕННЫЙ build_part
         def build_part(events, is_right):
             part = stream.Part()
             part.insert(0, instrument.Piano())
@@ -236,62 +238,93 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
                 part.insert(0, clef.BassClef())
 
             events.sort(key=lambda x: x["q_start"])
-            measure_idx = -1
-            measure = None
-            prev_notes = {}
-            last_end = 0.0
 
+            # Группировка по тактам с учётом переноса
+            measures = defaultdict(list)
             for evt in events:
                 start_ql = evt["q_start"]
                 dur_ql = evt["q_dur"]
-                pitch = evt["pitch"]
-                vel = evt["velocity"]
-
+                # Нота может начинаться ровно на границе или пересекать такт
                 m_idx = int(start_ql // 4.0)
                 m_offset = start_ql % 4.0
 
-                if m_idx != measure_idx:
-                    if measure is not None:
-                        part.append(measure)
-                    measure_idx = m_idx
-                    measure = stream.Measure(number=measure_idx + 1)
-                    last_end = 0.0
-                    prev_notes = {}
+                # Если нота начинается ровно на 4.0 — это начало следующего такта
+                if m_offset == 0.0 and start_ql > 0:
+                    m_idx = int(start_ql // 4.0)
 
-                gap = m_offset - last_end
-                if gap >= GRID_8TH:
-                    rest_ql = round(gap / GRID_8TH) * GRID_8TH
-                    rest_ql = min(rest_ql, 4.0 - last_end)
-                    if rest_ql >= GRID_8TH:
-                        r = m21_note.Rest()
-                        r.duration = m21_duration.Duration(quarterLength=rest_ql)
-                        measure.insert(last_end, r)
-                        last_end += rest_ql
+                # Если нота пересекает границу такта — разбиваем
+                remaining_dur = dur_ql
+                current_m_idx = m_idx
+                current_offset = m_offset
 
-                dur = min(dur_ql, 4.0 - m_offset)
-                if dur < GRID_8TH:
-                    continue
+                while remaining_dur > 0 and current_m_idx < 1000:
+                    space_in_measure = 4.0 - current_offset
+                    chunk_dur = min(remaining_dur, space_in_measure)
+                    chunk_dur = max(GRID_8TH, round(chunk_dur / GRID_8TH) * GRID_8TH)
 
-                n = m21_note.Note(midi=pitch)
-                n.duration = m21_duration.Duration(quarterLength=dur)
-                n.volume.velocity = vel
+                    if chunk_dur >= GRID_8TH:
+                        measures[current_m_idx].append({
+                            "offset": current_offset,
+                            "dur": chunk_dur,
+                            "pitch": evt["pitch"],
+                            "velocity": evt["velocity"],
+                        })
 
-                if vel > avg_vel * 1.3:
-                    n.articulations.append(articulations.Accent())
-                if dur <= 0.5:
-                    n.articulations.append(articulations.Staccato())
+                    remaining_dur -= chunk_dur
+                    current_m_idx += 1
+                    current_offset = 0.0
 
-                if pitch in prev_notes:
-                    prev = prev_notes[pitch]
-                    if prev.offset + prev.duration.quarterLength >= m_offset - 0.01:
-                        prev.tie = tie.Tie("start")
-                        n.tie = tie.Tie("stop")
+            # Собираем такты
+            for m_idx in sorted(measures.keys()):
+                measure = stream.Measure(number=m_idx + 1)
+                slot_notes = measures[m_idx]
+                slot_notes.sort(key=lambda x: x["offset"])
 
-                measure.insert(m_offset, n)
-                prev_notes[pitch] = n
-                last_end = max(last_end, m_offset + dur)
+                last_end = 0.0
+                prev_notes = {}
 
-            if measure is not None:
+                for note_data in slot_notes:
+                    offset = note_data["offset"]
+                    dur = note_data["dur"]
+                    pitch = note_data["pitch"]
+                    vel = note_data["velocity"]
+
+                    # Пауза?
+                    gap = offset - last_end
+                    if gap >= GRID_8TH:
+                        rest_ql = round(gap / GRID_8TH) * GRID_8TH
+                        rest_ql = min(rest_ql, 4.0 - last_end)
+                        if rest_ql >= GRID_8TH:
+                            r = m21_note.Rest()
+                            r.duration = m21_duration.Duration(quarterLength=rest_ql)
+                            measure.insert(last_end, r)
+                            last_end += rest_ql
+
+                    # Нота
+                    dur = min(dur, 4.0 - offset)
+                    if dur < GRID_8TH:
+                        continue
+
+                    n = m21_note.Note(midi=pitch)
+                    n.duration = m21_duration.Duration(quarterLength=dur)
+                    n.volume.velocity = vel
+
+                    if vel > avg_vel * 1.3:
+                        n.articulations.append(articulations.Accent())
+                    if dur <= 0.5:
+                        n.articulations.append(articulations.Staccato())
+
+                    # Лига
+                    if pitch in prev_notes:
+                        prev = prev_notes[pitch]
+                        if prev.offset + prev.duration.quarterLength >= offset - 0.01:
+                            prev.tie = tie.Tie("start")
+                            n.tie = tie.Tie("stop")
+
+                    measure.insert(offset, n)
+                    prev_notes[pitch] = n
+                    last_end = max(last_end, offset + dur)
+
                 part.append(measure)
 
             part.makeBeams(inPlace=True)
