@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="PianoMagic API", version="3.0.1")
+app = FastAPI(title="PianoMagic API", version="3.0.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,7 +35,7 @@ jobs = {}
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "version": "3.0.1"}
+    return {"status": "ok", "version": "3.0.2"}
 
 
 @app.post("/transcribe/file")
@@ -86,10 +86,9 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
         logger.info(f"[{job_id}] Начало обработки...")
 
         # ========== 1. Basic Pitch (ONNX) -> MIDI ==========
-        from basic_pitch.inference import predict_and_save
+        from basic_pitch.inference import predict
         from basic_pitch import ICASSP_2022_MODEL_PATH
 
-        # Явно указываем путь к ONNX-модели, чтобы не грузить TensorFlow
         onnx_model_path = Path(ICASSP_2022_MODEL_PATH).with_suffix(".onnx")
         if not onnx_model_path.exists():
             onnx_model_path = Path(ICASSP_2022_MODEL_PATH).parent / "nmp.onnx"
@@ -98,31 +97,20 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
         if not onnx_model_path.exists():
             raise FileNotFoundError(f"ONNX модель не найдена: {onnx_model_path}")
 
-        predict_and_save(
-            audio_path_list=[str(input_path)],
-            output_directory=str(midi_path.parent),
-            save_midi=True,
-            sonify_midi=False,
-            save_model_outputs=False,
-            save_notes=False,
+        # predict() возвращает: note_events, midi_data, contours
+        _, midi_data, _ = predict(
+            str(input_path),
             model_path=str(onnx_model_path),
         )
 
-        # Basic Pitch сохраняет файл как {input_name}_basic_pitch.mid
-        bp_output = midi_path.parent / f"{input_path.stem}_basic_pitch.mid"
-        if not bp_output.exists():
-            candidates = list(midi_path.parent.glob("*_basic_pitch.mid"))
-            if candidates:
-                bp_output = candidates[0]
-            else:
-                raise FileNotFoundError("Basic Pitch не создал MIDI-файл")
-
-        logger.info(f"[{job_id}] MIDI создан: {bp_output}")
+        # Сохраняем MIDI вручную
+        midi_data.write(str(midi_path))
+        logger.info(f"[{job_id}] MIDI создан: {midi_path}")
 
         # ========== 2. Пост-обработка music21 ==========
         from music21 import converter, stream, instrument, clef, note as m21_note, chord as m21_chord
 
-        score = converter.parse(str(bp_output))
+        score = converter.parse(str(midi_path))
 
         treble_notes = []
         bass_notes = []
@@ -182,6 +170,7 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
     finally:
         if input_path.exists():
             input_path.unlink()
+        # cleanup старого имени, если осталось
         bp_cleanup = midi_path.parent / f"{input_path.stem}_basic_pitch.mid"
         if bp_cleanup.exists():
             bp_cleanup.unlink()
