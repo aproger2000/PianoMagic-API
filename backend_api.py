@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="PianoMagic API", version="3.0.3")
+app = FastAPI(title="PianoMagic API", version="3.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,7 +35,7 @@ jobs = {}
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "version": "3.0.3"}
+    return {"status": "ok", "version": "3.1.0"}
 
 
 @app.post("/transcribe/file")
@@ -85,77 +85,129 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
     try:
         logger.info(f"[{job_id}] Начало обработки...")
 
-        # ========== 1. Basic Pitch (TFLite) -> MIDI ==========
-        from basic_pitch.inference import predict_and_save
-        from basic_pitch import ICASSP_2022_MODEL_PATH
-
-        logger.info(f"[{job_id}] Модель: {ICASSP_2022_MODEL_PATH}")
-
-        predict_and_save(
-            [str(input_path)],
-            str(midi_path.parent),
-            True,   # save_midi
-            False,  # sonify_midi
-            False,  # save_model_outputs
-            False,  # save_notes
-            ICASSP_2022_MODEL_PATH,  # model_or_model_path (TFLite на Python 3.10)
+        from basic_pitch.inference import predict
+        from music21 import (
+            stream, instrument, clef, note as m21_note, chord as m21_chord,
+            tempo, meter
         )
 
-        # Basic Pitch сохраняет файл как {input_name}_basic_pitch.mid
-        bp_output = midi_path.parent / f"{input_path.stem}_basic_pitch.mid"
-        if not bp_output.exists():
-            candidates = list(midi_path.parent.glob("*_basic_pitch.mid"))
-            if candidates:
-                bp_output = candidates[0]
+        # 1. Basic Pitch -> note_events (start, end, pitch, amplitude, bends)
+        _, _, note_events = predict(str(input_path))
+
+        logger.info(f"[{job_id}] Найдено нот: {len(note_events)}")
+
+        # 2. Фильтрация артефактов
+        MIN_AMP = 0.25      # минимальная громкость (0-1)
+        MIN_DUR = 0.08      # сек — слишком короткие ноты
+        MAX_RIGHT_POLY = 4  # макс нот в аккорде (правая рука)
+        MAX_LEFT_POLY = 3   # макс нот в аккорде (левая рука)
+        BPM = 120
+        SEC_PER_QUARTER = 60.0 / BPM
+        GRID = 0.5          # 1/8 note в quarterLength (чистый ритм)
+
+        filtered = []
+        for start, end, pitch, amp, _ in note_events:
+            dur = end - start
+            if amp < MIN_AMP or dur < MIN_DUR:
+                continue
+            filtered.append({
+                'start': start,
+                'end': end,
+                'pitch': int(pitch),
+                'velocity': min(127, int(amp * 127)),
+            })
+
+        logger.info(f"[{job_id}] После фильтрации: {len(filtered)}")
+        if not filtered:
+            raise ValueError("Не найдено подходящих нот в аудио")
+
+        # 3. Разделение по рукам (C4 = 60)
+        right_raw = [n for n in filtered if n['pitch'] >= 60]
+        left_raw = [n for n in filtered if n['pitch'] < 60]
+
+        # 4. Квантизация + ограничение полифонии
+        def quantize(t):
+            ql = t / SEC_PER_QUARTER
+            return round(ql / GRID) * GRID
+
+        def build_hand(raw_notes, max_poly):
+            buckets = {}
+            for n in raw_notes:
+                q_start = quantize(n['start'])
+                q_end = quantize(n['end'])
+                q_dur = max(GRID, q_end - q_start)
+                buckets.setdefault(q_start, []).append({**n, 'q_dur': q_dur})
+
+            items = []
+            for offset in sorted(buckets.keys()):
+                notes = buckets[offset]
+                # Оставляем самые громкие
+                notes.sort(key=lambda x: x['velocity'], reverse=True)
+                notes = notes[:max_poly]
+
+                # Уникальные pitch (убираем дубли)
+                seen = set()
+                unique = []
+                for note in notes:
+                    if note['pitch'] not in seen:
+                        seen.add(note['pitch'])
+                        unique.append(note)
+
+                if unique:
+                    items.append((offset, unique))
+            return items
+
+        right_hand = build_hand(right_raw, MAX_RIGHT_POLY)
+        left_hand = build_hand(left_raw, MAX_LEFT_POLY)
+
+        logger.info(f"[{job_id}] Правая: {len(right_hand)} акк., Левая: {len(left_hand)} акк.")
+
+        # 5. Создаём нотный текст с нуля
+        score = stream.Score()
+        score.insert(0, tempo.MetronomeMark(number=BPM))
+        score.insert(0, meter.TimeSignature('4/4'))
+
+        # Правая рука
+        right_part = stream.Part()
+        right_part.insert(0, instrument.Piano())
+
+        for offset, notes in right_hand:
+            if len(notes) == 1:
+                n = m21_note.Note(notes[0]['pitch'])
+                n.duration.quarterLength = notes[0]['q_dur']
+                n.volume.velocity = notes[0]['velocity']
+                right_part.insert(offset, n)
             else:
-                raise FileNotFoundError("Basic Pitch не создал MIDI-файл")
+                c = m21_chord.Chord([p['pitch'] for p in notes])
+                c.duration.quarterLength = notes[0]['q_dur']
+                c.volume.velocity = notes[0]['velocity']
+                right_part.insert(offset, c)
 
-        logger.info(f"[{job_id}] MIDI создан: {bp_output}")
+        # Левая рука
+        left_part = stream.Part()
+        left_part.insert(0, instrument.Piano())
+        left_part.insert(0, clef.BassClef())
 
-        # ========== 2. Пост-обработка music21 ==========
-        from music21 import converter, stream, instrument, clef, note as m21_note, chord as m21_chord
+        for offset, notes in left_hand:
+            if len(notes) == 1:
+                n = m21_note.Note(notes[0]['pitch'])
+                n.duration.quarterLength = notes[0]['q_dur']
+                n.volume.velocity = notes[0]['velocity']
+                left_part.insert(offset, n)
+            else:
+                c = m21_chord.Chord([p['pitch'] for p in notes])
+                c.duration.quarterLength = notes[0]['q_dur']
+                c.volume.velocity = notes[0]['velocity']
+                left_part.insert(offset, c)
 
-        score = converter.parse(str(bp_output))
+        score.insert(0, right_part)
+        score.insert(0, left_part)
 
-        treble_notes = []
-        bass_notes = []
+        # 6. Сохраняем MIDI
+        score.write("midi", str(midi_path))
+        logger.info(f"[{job_id}] MIDI записан")
 
-        for element in score.recurse():
-            if isinstance(element, m21_note.Note):
-                (treble_notes if element.pitch.midi >= 60 else bass_notes).append(element)
-            elif isinstance(element, m21_chord.Chord):
-                for pitch in element.pitches:
-                    n = m21_note.Note(pitch)
-                    n.duration = element.duration
-                    n.offset = element.offset
-                    (treble_notes if pitch.midi >= 60 else bass_notes).append(n)
-
-        new_score = stream.Score()
-
-        right_hand = stream.Part()
-        right_hand.insert(0, instrument.Piano())
-
-        left_hand = stream.Part()
-        left_hand.insert(0, instrument.Piano())
-        left_hand.insert(0, clef.BassClef())
-
-        for n in treble_notes:
-            right_hand.insert(n.offset, n)
-        for n in bass_notes:
-            left_hand.insert(n.offset, n)
-
-        new_score.insert(0, right_hand)
-        new_score.insert(0, left_hand)
-
-        try:
-            new_score = new_score.quantize(quarterLengthDivisors=[4, 3], inPlace=False)
-        except Exception as e:
-            logger.warning(f"[{job_id}] Квантизация пропущена: {e}")
-
-        new_score.write("midi", str(midi_path))
-        logger.info(f"[{job_id}] Пост-обработка завершена")
-
-        # ========== 3. MuseScore3 -> PDF ==========
+        # 7. MuseScore -> PDF
         result = subprocess.run(
             ["musescore3", "-o", str(pdf_path), str(midi_path)],
             capture_output=True,
@@ -165,7 +217,7 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
         if result.returncode != 0:
             raise RuntimeError(f"MuseScore3 error: {result.stderr}")
 
-        logger.info(f"[{job_id}] PDF создан: {pdf_path}")
+        logger.info(f"[{job_id}] PDF создан")
         jobs[job_id]["status"] = "completed"
 
     except Exception as e:
@@ -175,6 +227,3 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
     finally:
         if input_path.exists():
             input_path.unlink()
-        bp_cleanup = midi_path.parent / f"{input_path.stem}_basic_pitch.mid"
-        if bp_cleanup.exists():
-            bp_cleanup.unlink()
