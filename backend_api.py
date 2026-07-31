@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="PianoMagic API", version="3.3.0")
+app = FastAPI(title="PianoMagic API", version="3.4.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -34,12 +34,11 @@ jobs = {}
 BPM = 120
 SEC_PER_QUARTER = 60.0 / BPM
 GRID_8TH = 0.5
-MIN_AMP = 0.25
 
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "version": "3.3.0"}
+    return {"status": "ok", "version": "3.4.0"}
 
 
 @app.post("/transcribe/file")
@@ -50,14 +49,14 @@ async def transcribe_file(background_tasks: BackgroundTasks, file: UploadFile = 
 
     ext = Path(file.filename or "input.mp3").suffix
     input_path = job_dir / f"input{ext}"
-    midi_path = job_dir / "output.mid"
+    xml_path = job_dir / "output.xml"
     pdf_path = job_dir / "output.pdf"
 
     with open(input_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
     jobs[job_id] = {"status": "processing", "pdf_path": str(pdf_path), "error": None}
-    background_tasks.add_task(process_audio, job_id, input_path, midi_path, pdf_path)
+    background_tasks.add_task(process_audio, job_id, input_path, xml_path, pdf_path)
 
     return {"job_id": job_id, "status": "processing"}
 
@@ -87,73 +86,62 @@ async def download_pdf(job_id: str):
     )
 
 
-def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path):
+def process_audio(job_id: str, input_path: Path, xml_path: Path, pdf_path: Path):
     try:
-        logger.info(f"[{job_id}] === Начало v3.3.0 (только мелодия, только скрипичный ключ) ===")
+        logger.info(f"[{job_id}] === Начало v3.4.0 (pYIN + только скрипичный) ===")
 
-        from basic_pitch.inference import predict
+        import librosa
+        import numpy as np
         from music21 import (
-            stream, instrument, note as m21_note,
+            stream, instrument, note as m21_note, clef,
             tempo, meter, key, duration as m21_duration,
             tie, pitch as m21_pitch, articulations
         )
 
-        # 1. Basic Pitch -> note_events
-        _, _, note_events = predict(str(input_path))
-        logger.info(f"[{job_id}] Всего нот: {len(note_events)}")
+        # 1. Загрузка аудио
+        y, sr = librosa.load(str(input_path), sr=22050, mono=True)
+        logger.info(f"[{job_id}] Аудио загружено: {len(y)} samples @ {sr}Hz")
 
-        if not note_events:
-            raise ValueError("Ноты не найдены")
+        # 2. pYIN — извлечение мелодии (f0)
+        f0, voiced_flag, voiced_probs = librosa.pyin(
+            y,
+            fmin=librosa.note_to_hz('C4'),   # не ниже C4
+            fmax=librosa.note_to_hz('C7'),   # не выше C7
+            sr=sr,
+            frame_length=2048,
+        )
+        logger.info(f"[{job_id}] pYIN завершён")
 
-        # 2. Фильтрация по громкости
-        notes = []
-        for start, end, pitch, amp, _ in note_events:
-            if amp < MIN_AMP:
-                continue
-            notes.append({
-                "start": float(start),
-                "end": float(end),
-                "pitch": int(pitch),
-                "velocity": min(127, int(amp * 127)),
-            })
-
-        if not notes:
-            raise ValueError("После фильтрации нот не осталось")
-
-        # 3. === ИЗВЛЕЧЕНИЕ ТОЛЬКО МЕЛОДИИ (верхний голос, монофония) ===
-        TIME_RES = 0.1
-        timeline = {}
-
-        for n in notes:
-            t = n["start"]
-            while t < n["end"]:
-                slot = round(t / TIME_RES) * TIME_RES
-                # В каждый момент времени оставляем только самую высокую ноту
-                if slot not in timeline or n["pitch"] > timeline[slot]["pitch"]:
-                    timeline[slot] = n
-                t += TIME_RES
-
-        # Собираем мелодическую линию
-        slots = sorted(timeline.keys())
+        # 3. Конвертация f0 → MIDI-ноты
+        times = librosa.frames_to_time(np.arange(len(f0)), sr=sr, hop_length=512)
         melody = []
-        for slot in slots:
-            n = timeline[slot]
-            if not melody or n["pitch"] != melody[-1]["pitch"]:
-                melody.append({
-                    "start": slot,
-                    "pitch": n["pitch"],
-                    "velocity": n["velocity"],
-                })
 
-        # Вычисляем длительности
-        for i in range(len(melody)):
-            if i + 1 < len(melody):
-                melody[i]["dur"] = melody[i + 1]["start"] - melody[i]["start"]
-            else:
-                melody[i]["dur"] = 0.5
+        current_note = None
+        current_start = 0
+        min_note_len = 0.08  # сек
 
-        # Убираем слишком короткие
-        melody = [m for m in melody if m["dur"] >= 0.08]
+        for t, freq, voiced in zip(times, f0, voiced_flag):
+            if not voiced or freq is None or np.isnan(freq):
+                if current_note is not None:
+                    dur = t - current_start
+                    if dur >= min_note_len:
+                        melody.append({**current_note, "end": t})
+                    current_note = None
+                continue
+
+            midi_pitch = int(round(librosa.hz_to_midi(freq)))
+
+            if current_note is None or current_note["pitch"] != midi_pitch:
+                if current_note is not None:
+                    dur = t - current_start
+                    if dur >= min_note_len:
+                        melody.append({**current_note, "end": t})
+                current_note = {"pitch": midi_pitch, "start": t}
+                current_start = t
+
+        # Закрываем последнюю ноту
+        if current_note is not None:
+            melody.append({**current_note, "end": times[-1] if len(times) > 0 else current_start + 0.5})
 
         logger.info(f"[{job_id}] Мелодия: {len(melody)} нот")
 
@@ -179,7 +167,7 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
 
         logger.info(f"[{job_id}] Тональность: {detected_key.name}")
 
-        # 5. Квантизация до 1/8
+        # 5. Квантизация
         def quantize(t):
             ql = t / SEC_PER_QUARTER
             return round(ql / GRID_8TH) * GRID_8TH
@@ -187,27 +175,24 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
         quantized = []
         for m in melody:
             qs = quantize(m["start"])
-            qdur = max(GRID_8TH, round(m["dur"] / SEC_PER_QUARTER / GRID_8TH) * GRID_8TH)
+            qdur = max(GRID_8TH, round((m["end"] - m["start"]) / SEC_PER_QUARTER / GRID_8TH) * GRID_8TH)
             qdur = min(4.0, qdur)
             quantized.append({
                 "start": qs,
                 "dur": qdur,
                 "pitch": m["pitch"],
-                "velocity": m["velocity"],
             })
 
-        # 6. === СОЗДАНИЕ НОТНОГО ТЕКСТА: ТОЛЬКО ОДНА ЛИНИЯ, ТОЛЬКО СКРИПИЧНЫЙ КЛЮЧ ===
+        # 6. Создание нотного текста — ТОЛЬКО скрипичный ключ, ТОЛЬКО одна линия
         score = stream.Score()
 
-        # ОДНА часть (одна рука)
         part = stream.Part()
         part.insert(0, instrument.Piano())
+        part.insert(0, clef.TrebleClef())  # ← ЯВНО скрипичный ключ
         part.insert(0, detected_key)
         part.insert(0, meter.TimeSignature("4/4"))
         part.insert(0, tempo.MetronomeMark(number=BPM))
-        # Скрипичный ключ по умолчанию — ничего не добавляем, bass clef НЕ ставим
 
-        # Раскладываем по тактам
         measures = {}
         for n in quantized:
             m_idx = int(n["start"] // 4.0)
@@ -216,8 +201,6 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
                 m_idx += 1
                 off = 0.0
             measures.setdefault(m_idx, []).append(n)
-
-        avg_vel = sum(m["velocity"] for m in quantized) / len(quantized)
 
         for m_idx in sorted(measures.keys()):
             measure = stream.Measure(number=m_idx + 1)
@@ -232,7 +215,6 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
                 if dur < GRID_8TH:
                     continue
 
-                # Пауза
                 gap = off - last_end
                 if gap >= GRID_8TH:
                     r = m21_note.Rest()
@@ -240,20 +222,13 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
                     measure.insert(last_end, r)
                     last_end += r.duration.quarterLength
 
-                # Нота
                 n = m21_note.Note(midi=nd["pitch"])
                 n.duration = m21_duration.Duration(quarterLength=dur)
-                n.volume.velocity = nd["velocity"]
 
-                # Лига
                 if prev_note and prev_note.pitch.midi == nd["pitch"]:
                     if prev_note.offset + prev_note.duration.quarterLength >= off - 0.01:
                         prev_note.tie = tie.Tie("start")
                         n.tie = tie.Tie("stop")
-
-                # Акцент
-                if nd["velocity"] > avg_vel * 1.3:
-                    n.articulations.append(articulations.Accent())
 
                 measure.insert(off, n)
                 prev_note = n
@@ -268,12 +243,13 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
 
         score.insert(0, part)
 
-        # 7. Сохранение
-        score.write("midi", str(midi_path))
-        logger.info(f"[{job_id}] MIDI записан")
+        # 7. Сохраняем MusicXML (clef сохраняется точно, в отличие от MIDI)
+        score.write("musicxml", str(xml_path))
+        logger.info(f"[{job_id}] MusicXML записан")
 
+        # MuseScore: XML → PDF
         result = subprocess.run(
-            ["musescore3", "-o", str(pdf_path), str(midi_path)],
+            ["musescore3", "-o", str(pdf_path), str(xml_path)],
             capture_output=True,
             text=True,
             timeout=120,
@@ -291,3 +267,5 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
     finally:
         if input_path.exists():
             input_path.unlink()
+        if xml_path.exists():
+            xml_path.unlink()
