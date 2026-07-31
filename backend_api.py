@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import logging
 from pathlib import Path
+from collections import defaultdict
 
 from fastapi import FastAPI, File, UploadFile, BackgroundTasks, HTTPException
 from fastapi.responses import FileResponse
@@ -12,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="PianoMagic API", version="3.1.0")
+app = FastAPI(title="PianoMagic API", version="3.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -29,13 +30,23 @@ app.add_middleware(
 
 JOBS_DIR = Path("/tmp/pianomagic_jobs")
 JOBS_DIR.mkdir(exist_ok=True)
-
 jobs = {}
+
+# ====== Константы ТЗ ======
+BPM = 120
+SEC_PER_QUARTER = 60.0 / BPM
+GRID_8TH = 0.5  # quarterLength восьмой
+MIN_AMP = 0.30
+MIN_DUR_SEC = 0.10
+MAX_DUR_QL = 4.0  # целая нота
+RIGHT_POLY_MAX = 4
+LEFT_POLY_MAX = 3
+MAX_KEY_SHARPS = 3
 
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "version": "3.1.0"}
+    return {"status": "ok", "version": "3.2.0"}
 
 
 @app.post("/transcribe/file")
@@ -69,11 +80,9 @@ async def get_status(job_id: str):
 async def download_pdf(job_id: str):
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-
     pdf_path = Path(jobs[job_id]["pdf_path"])
     if not pdf_path.exists():
         raise HTTPException(status_code=404, detail="PDF not ready")
-
     return FileResponse(
         pdf_path,
         media_type="application/pdf",
@@ -83,127 +92,232 @@ async def download_pdf(job_id: str):
 
 def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path):
     try:
-        logger.info(f"[{job_id}] Начало обработки...")
-
+        logger.info(f"[{job_id}] Начало обработки v3.2.0...")
         from basic_pitch.inference import predict
         from music21 import (
             stream, instrument, clef, note as m21_note, chord as m21_chord,
-            tempo, meter
+            tempo, meter, key, duration as m21_duration, articulations,
+            tie, pitch as m21_pitch
         )
 
-        # 1. Basic Pitch -> note_events (start, end, pitch, amplitude, bends)
+        # 1. Basic Pitch -> note_events
         _, _, note_events = predict(str(input_path))
-
         logger.info(f"[{job_id}] Найдено нот: {len(note_events)}")
 
-        # 2. Фильтрация артефактов
-        MIN_AMP = 0.25      # минимальная громкость (0-1)
-        MIN_DUR = 0.08      # сек — слишком короткие ноты
-        MAX_RIGHT_POLY = 4  # макс нот в аккорде (правая рука)
-        MAX_LEFT_POLY = 3   # макс нот в аккорде (левая рука)
-        BPM = 120
-        SEC_PER_QUARTER = 60.0 / BPM
-        GRID = 0.5          # 1/8 note в quarterLength (чистый ритм)
+        if not note_events:
+            raise ValueError("Ноты не найдены")
 
-        filtered = []
-        for start, end, pitch, amp, _ in note_events:
+        # 2. Фильтрация и нормализация
+        notes_raw = []
+        for start, end, pitch_val, amp, _ in note_events:
             dur = end - start
-            if amp < MIN_AMP or dur < MIN_DUR:
+            if amp < MIN_AMP or dur < MIN_DUR_SEC:
                 continue
-            filtered.append({
-                'start': start,
-                'end': end,
-                'pitch': int(pitch),
-                'velocity': min(127, int(amp * 127)),
+            p = int(pitch_val)
+            # Ограничение диапазона C1-C7 (24-96), перенос октав
+            while p < 24:
+                p += 12
+            while p > 96:
+                p -= 12
+            notes_raw.append({
+                "start": start,
+                "end": end,
+                "pitch": p,
+                "velocity": min(127, int(amp * 127)),
             })
 
-        logger.info(f"[{job_id}] После фильтрации: {len(filtered)}")
-        if not filtered:
-            raise ValueError("Не найдено подходящих нот в аудио")
+        if not notes_raw:
+            raise ValueError("После фильтрации нот не осталось")
 
-        # 3. Разделение по рукам (C4 = 60)
-        right_raw = [n for n in filtered if n['pitch'] >= 60]
-        left_raw = [n for n in filtered if n['pitch'] < 60]
+        avg_vel = sum(n["velocity"] for n in notes_raw) / len(notes_raw)
 
-        # 4. Квантизация + ограничение полифонии
-        def quantize(t):
+        # 3. Определение тональности (Krumhansl-Schmuckler)
+        try:
+            from music21.analysis import discrete
+            s_tmp = stream.Stream()
+            for n in notes_raw:
+                s_tmp.append(m21_note.Note(midi=n["pitch"], quarterLength=0.5))
+            analyzer = discrete.KrumhanslSchmuckler()
+            detected_key = analyzer.getSolution(s_tmp)
+        except Exception:
+            detected_key = key.Key("C")
+
+        sharps = detected_key.sharps
+        if abs(sharps) > MAX_KEY_SHARPS:
+            candidates = [0, 1, 2, 3, -1, -2, -3]
+            best = min(candidates, key=lambda c: abs(c - sharps))
+            # Создаём ключ по количеству знаков
+            if best >= 0:
+                detected_key = key.Key(m21_pitch.Pitch(sharps=best).name)
+            else:
+                detected_key = key.Key(m21_pitch.Pitch(sharps=best).name)
+            sharps = best
+
+        logger.info(f"[{job_id}] Тональность: {detected_key.name} ({sharps} знаков)")
+
+        # 4. Разделение по рукам
+        right_notes = []
+        left_notes = []
+        for n in notes_raw:
+            p = n["pitch"]
+            if p >= 60:
+                right_notes.append(n)
+            else:
+                left_notes.append(n)
+
+        # 5. Квантизация и подготовка
+        def quantize_ql(t):
             ql = t / SEC_PER_QUARTER
-            return round(ql / GRID) * GRID
+            q = round(ql / GRID_8TH) * GRID_8TH
+            return max(0.0, q)
 
-        def build_hand(raw_notes, max_poly):
-            buckets = {}
-            for n in raw_notes:
-                q_start = quantize(n['start'])
-                q_end = quantize(n['end'])
-                q_dur = max(GRID, q_end - q_start)
-                buckets.setdefault(q_start, []).append({**n, 'q_dur': q_dur})
+        def prepare_hand(raw, poly_max, is_right):
+            quantized = []
+            for n in raw:
+                qs = quantize_ql(n["start"])
+                qe = quantize_ql(n["end"])
+                qdur = max(GRID_8TH, round((qe - qs) / GRID_8TH) * GRID_8TH)
+                qdur = min(MAX_DUR_QL, qdur)
+                quantized.append({**n, "q_start": qs, "q_dur": qdur})
 
-            items = []
-            for offset in sorted(buckets.keys()):
-                notes = buckets[offset]
-                # Оставляем самые громкие
-                notes.sort(key=lambda x: x['velocity'], reverse=True)
-                notes = notes[:max_poly]
+            # Группировка по слотам
+            slots = defaultdict(list)
+            for n in quantized:
+                slot = round(n["q_start"] / GRID_8TH) * GRID_8TH
+                slots[slot].append(n)
 
-                # Уникальные pitch (убираем дубли)
+            result = []
+            for slot in sorted(slots.keys()):
+                notes = slots[slot]
+                notes.sort(key=lambda x: x["velocity"], reverse=True)
+
+                # Уникальные pitch
                 seen = set()
                 unique = []
                 for note in notes:
-                    if note['pitch'] not in seen:
-                        seen.add(note['pitch'])
+                    if note["pitch"] not in seen:
+                        seen.add(note["pitch"])
                         unique.append(note)
+                notes = unique[:poly_max]
 
-                if unique:
-                    items.append((offset, unique))
-            return items
+                # Фильтр интервалов для левой руки
+                if not is_right:
+                    pitches_sorted = sorted(notes, key=lambda x: x["pitch"])
+                    skip = set()
+                    for i, a in enumerate(pitches_sorted):
+                        if i in skip:
+                            continue
+                        for j, b in enumerate(pitches_sorted):
+                            if i >= j or j in skip:
+                                continue
+                            if abs(a["pitch"] - b["pitch"]) == 1:
+                                if a["velocity"] < b["velocity"]:
+                                    skip.add(i)
+                                else:
+                                    skip.add(j)
+                    filtered = [pitches_sorted[i] for i in range(len(pitches_sorted)) if i not in skip]
+                    notes = filtered[:poly_max]
 
-        right_hand = build_hand(right_raw, MAX_RIGHT_POLY)
-        left_hand = build_hand(left_raw, MAX_LEFT_POLY)
+                    # M7 (11 полутонов) -> октавный дубль
+                    for n in notes:
+                        for other in notes:
+                            if n is not other and abs(n["pitch"] - other["pitch"]) == 11:
+                                if n["pitch"] < other["pitch"]:
+                                    n["pitch"] += 12
 
-        logger.info(f"[{job_id}] Правая: {len(right_hand)} акк., Левая: {len(left_hand)} акк.")
+                result.extend(notes)
+            return result
 
-        # 5. Создаём нотный текст с нуля
+        right_events = prepare_hand(right_notes, RIGHT_POLY_MAX, True)
+        left_events = prepare_hand(left_notes, LEFT_POLY_MAX, False)
+
+        logger.info(f"[{job_id}] Правая: {len(right_events)}, Левая: {len(left_events)}")
+
+        # 6. Создание тактов 4/4
+        def build_part(events, is_right):
+            part = stream.Part()
+            part.insert(0, instrument.Piano())
+            part.insert(0, detected_key)
+            part.insert(0, meter.TimeSignature("4/4"))
+            part.insert(0, tempo.MetronomeMark(number=BPM))
+            if not is_right:
+                part.insert(0, clef.BassClef())
+
+            events.sort(key=lambda x: x["q_start"])
+
+            measure_idx = -1
+            measure = None
+            prev_notes = {}  # pitch -> note object for tie
+            last_end = 0.0
+
+            for evt in events:
+                start_ql = evt["q_start"]
+                dur_ql = evt["q_dur"]
+                pitch = evt["pitch"]
+                vel = evt["velocity"]
+
+                m_idx = int(start_ql // 4.0)
+                m_offset = start_ql % 4.0
+
+                if m_idx != measure_idx:
+                    if measure is not None:
+                        part.append(measure)
+                    measure_idx = m_idx
+                    measure = stream.Measure(number=measure_idx + 1)
+                    last_end = 0.0
+                    prev_notes = {}
+
+                # Пауза?
+                gap = m_offset - last_end
+                if gap >= GRID_8TH:
+                    rest_ql = round(gap / GRID_8TH) * GRID_8TH
+                    rest_ql = min(rest_ql, 4.0 - last_end)
+                    if rest_ql >= GRID_8TH:
+                        r = m21_note.Rest()
+                        r.duration = m21_duration.Duration(quarterLength=rest_ql)
+                        measure.insert(last_end, r)
+                        last_end += rest_ql
+
+                # Нота
+                dur = min(dur_ql, 4.0 - m_offset)
+                if dur < GRID_8TH:
+                    continue
+
+                n = m21_note.Note(midi=pitch)
+                n.duration = m21_duration.Duration(quarterLength=dur)
+                n.volume.velocity = vel
+
+                # Акцент
+                if vel > avg_vel * 1.3:
+                    n.articulations.append(articulations.Accent())
+                # Стаккато для коротких
+                if dur <= 0.5:
+                    n.articulations.append(articulations.Staccato())
+
+                # Лига
+                if pitch in prev_notes:
+                    prev = prev_notes[pitch]
+                    if prev.offset + prev.duration.quarterLength >= m_offset - 0.01:
+                        prev.tie = tie.Tie("start")
+                        n.tie = tie.Tie("stop")
+
+                measure.insert(m_offset, n)
+                prev_notes[pitch] = n
+                last_end = max(last_end, m_offset + dur)
+
+            if measure is not None:
+                part.append(measure)
+
+            part.makeBeams(inPlace=True)
+            return part
+
+        right_part = build_part(right_events, True)
+        left_part = build_part(left_events, False)
+
         score = stream.Score()
-        score.insert(0, tempo.MetronomeMark(number=BPM))
-        score.insert(0, meter.TimeSignature('4/4'))
-
-        # Правая рука
-        right_part = stream.Part()
-        right_part.insert(0, instrument.Piano())
-
-        for offset, notes in right_hand:
-            if len(notes) == 1:
-                n = m21_note.Note(notes[0]['pitch'])
-                n.duration.quarterLength = notes[0]['q_dur']
-                n.volume.velocity = notes[0]['velocity']
-                right_part.insert(offset, n)
-            else:
-                c = m21_chord.Chord([p['pitch'] for p in notes])
-                c.duration.quarterLength = notes[0]['q_dur']
-                c.volume.velocity = notes[0]['velocity']
-                right_part.insert(offset, c)
-
-        # Левая рука
-        left_part = stream.Part()
-        left_part.insert(0, instrument.Piano())
-        left_part.insert(0, clef.BassClef())
-
-        for offset, notes in left_hand:
-            if len(notes) == 1:
-                n = m21_note.Note(notes[0]['pitch'])
-                n.duration.quarterLength = notes[0]['q_dur']
-                n.volume.velocity = notes[0]['velocity']
-                left_part.insert(offset, n)
-            else:
-                c = m21_chord.Chord([p['pitch'] for p in notes])
-                c.duration.quarterLength = notes[0]['q_dur']
-                c.volume.velocity = notes[0]['velocity']
-                left_part.insert(offset, c)
-
         score.insert(0, right_part)
         score.insert(0, left_part)
 
-        # 6. Сохраняем MIDI
         score.write("midi", str(midi_path))
         logger.info(f"[{job_id}] MIDI записан")
 
