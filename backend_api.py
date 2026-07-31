@@ -89,7 +89,7 @@ async def download_pdf(job_id: str):
 
 def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path):
     try:
-        logger.info(f"[{job_id}] === Начало v3.3.0 (мелодия) ===")
+        logger.info(f"[{job_id}] === Начало v3.3.0 (только мелодия, только скрипичный ключ) ===")
 
         from basic_pitch.inference import predict
         from music21 import (
@@ -120,8 +120,7 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
         if not notes:
             raise ValueError("После фильтрации нот не осталось")
 
-        # 3. === ИЗВЛЕЧЕНИЕ ТОЛЬКО МЕЛОДИИ (верхний голос) ===
-        # Разбиваем timeline на слоты по 0.1 сек, в каждом оставляем только верхнюю ноту
+        # 3. === ИЗВЛЕЧЕНИЕ ТОЛЬКО МЕЛОДИИ (верхний голос, монофония) ===
         TIME_RES = 0.1
         timeline = {}
 
@@ -129,11 +128,12 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
             t = n["start"]
             while t < n["end"]:
                 slot = round(t / TIME_RES) * TIME_RES
+                # В каждый момент времени оставляем только самую высокую ноту
                 if slot not in timeline or n["pitch"] > timeline[slot]["pitch"]:
                     timeline[slot] = n
                 t += TIME_RES
 
-        # Сортируем по времени, убираем дубли подряд
+        # Собираем мелодическую линию
         slots = sorted(timeline.keys())
         melody = []
         for slot in slots:
@@ -144,16 +144,13 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
                     "pitch": n["pitch"],
                     "velocity": n["velocity"],
                 })
-            else:
-                # Продолжаем предыдущую ноту
-                pass
 
-        # Вычисляем длительности (end = start следующей ноты или +0.5)
+        # Вычисляем длительности
         for i in range(len(melody)):
             if i + 1 < len(melody):
                 melody[i]["dur"] = melody[i + 1]["start"] - melody[i]["start"]
             else:
-                melody[i]["dur"] = 0.5  # последняя нота
+                melody[i]["dur"] = 0.5
 
         # Убираем слишком короткие
         melody = [m for m in melody if m["dur"] >= 0.08]
@@ -199,14 +196,18 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
                 "velocity": m["velocity"],
             })
 
-        # 6. Создание нотного текста — только одна линия (скрипичный ключ)
+        # 6. === СОЗДАНИЕ НОТНОГО ТЕКСТА: ТОЛЬКО ОДНА ЛИНИЯ, ТОЛЬКО СКРИПИЧНЫЙ КЛЮЧ ===
         score = stream.Score()
+
+        # ОДНА часть (одна рука)
         part = stream.Part()
         part.insert(0, instrument.Piano())
         part.insert(0, detected_key)
         part.insert(0, meter.TimeSignature("4/4"))
         part.insert(0, tempo.MetronomeMark(number=BPM))
+        # Скрипичный ключ по умолчанию — ничего не добавляем, bass clef НЕ ставим
 
+        # Раскладываем по тактам
         measures = {}
         for n in quantized:
             m_idx = int(n["start"] // 4.0)
@@ -214,9 +215,7 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
             if off >= 3.999:
                 m_idx += 1
                 off = 0.0
-            if m_idx not in measures:
-                measures[m_idx] = []
-            measures[m_idx].append(n)
+            measures.setdefault(m_idx, []).append(n)
 
         avg_vel = sum(m["velocity"] for m in quantized) / len(quantized)
 
@@ -246,7 +245,7 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
                 n.duration = m21_duration.Duration(quarterLength=dur)
                 n.volume.velocity = nd["velocity"]
 
-                # Лига между одинаковыми нотами
+                # Лига
                 if prev_note and prev_note.pitch.midi == nd["pitch"]:
                     if prev_note.offset + prev_note.duration.quarterLength >= off - 0.01:
                         prev_note.tie = tie.Tie("start")
