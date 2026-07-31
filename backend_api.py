@@ -5,7 +5,7 @@ import subprocess
 from pathlib import Path
 
 from fastapi import FastAPI, File, UploadFile, BackgroundTasks, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI(title="PianoMagic API", version="3.0.0")
@@ -27,6 +27,11 @@ JOBS_DIR = Path("/tmp/pianomagic_jobs")
 JOBS_DIR.mkdir(exist_ok=True)
 
 jobs = {}
+
+
+@app.get("/")
+async def root():
+    return {"status": "ok", "version": "3.0.0"}
 
 
 @app.post("/transcribe/file")
@@ -74,8 +79,7 @@ async def download_pdf(job_id: str):
 
 def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path):
     try:
-        # ========== 1. Basic Pitch (TFLite) -> MIDI ==========
-        # Импорт внутри функции, чтобы сервер стартовал даже при проблемах с зависимостями
+        # ========== 1. Basic Pitch (ONNX) -> MIDI ==========
         from basic_pitch.inference import predict_and_save
 
         predict_and_save(
@@ -87,7 +91,6 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
             save_notes=False,
         )
 
-        # Basic Pitch сохраняет файл как {input_name}_basic_pitch.mid
         bp_output = midi_path.parent / f"{input_path.stem}_basic_pitch.mid"
         if not bp_output.exists():
             candidates = list(midi_path.parent.glob("*_basic_pitch.mid"))
@@ -97,7 +100,7 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
                 raise FileNotFoundError("Basic Pitch не создал MIDI-файл")
 
         # ========== 2. Пост-обработка music21 ==========
-        from music21 import converter, stream, instrument, clef, note as m21_note, chord as m21_chord, duration
+        from music21 import converter, stream, instrument, clef, note as m21_note, chord as m21_chord
 
         score = converter.parse(str(bp_output))
 
@@ -131,7 +134,6 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
         new_score.insert(0, right_hand)
         new_score.insert(0, left_hand)
 
-        # Квантизация до 1/16
         try:
             new_score = new_score.quantize(quarterLengthDivisors=[4, 3], inPlace=False)
         except Exception:
@@ -155,7 +157,6 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
         jobs[job_id]["status"] = "failed"
         jobs[job_id]["error"] = str(e)
     finally:
-        # Очистка
         if input_path.exists():
             input_path.unlink()
         bp_cleanup = midi_path.parent / f"{input_path.stem}_basic_pitch.mid"
