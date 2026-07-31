@@ -1,6 +1,5 @@
 """
-PianoMagic API — ByteDance Piano Transcription Edition
-FastAPI + ByteDance Piano Transcription (PyTorch) + music21
+PianoMagic API — Piano Edition (разделение рук + квантизация)
 """
 
 import asyncio
@@ -18,8 +17,9 @@ from music21 import (
     converter, stream, note, chord, meter, key, instrument,
     clef, layout, metadata
 )
+from basic_pitch.inference import predict
 
-app = FastAPI(title="PianoMagic API ByteDance", version="10.0.0")
+app = FastAPI(title="PianoMagic API Piano", version="12.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -39,25 +39,11 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 MAX_FILE_SIZE = 50 * 1024 * 1024
 jobs = {}
 
-_transcriptor = None
-
-def get_transcriptor():
-    global _transcriptor
-    if _transcriptor is None:
-        print("[INIT] Loading ByteDance Piano Transcription...")
-        from piano_transcription_inference import PianoTranscription
-        _transcriptor = PianoTranscription(device='cpu', checkpoint_path=None)
-        print("[INIT] Loaded")
-    return _transcriptor
-
 
 def transcribe_sync(input_path: Path, midi_path: Path):
     print(f"[TRANSCRIBE] {input_path}")
-    from piano_transcription_inference import load_audio, sample_rate
-
-    audio, _ = load_audio(str(input_path), sr=sample_rate, mono=True)
-    transcriptor = get_transcriptor()
-    transcriptor.transcribe(audio, str(midi_path))
+    _, midi_data, _ = predict(str(input_path))
+    midi_data.write(str(midi_path))
     print(f"[TRANSCRIBE] MIDI done")
 
 
@@ -163,7 +149,7 @@ def process_midi_to_sheet(midi_path: Path, pdf_path: Path, title: str):
 async def process_audio_async(job_id: str, input_path: Path):
     try:
         jobs[job_id]["status"] = "transcribing"
-        jobs[job_id]["message"] = "ByteDance AI анализирует фортепиано..."
+        jobs[job_id]["message"] = "AI анализирует аудио..."
 
         job_dir = TEMP_DIR / job_id
         job_dir.mkdir(exist_ok=True)
@@ -248,12 +234,12 @@ async def download_file(filename: str):
 
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "PianoMagic API ByteDance"}
+    return {"status": "ok", "service": "PianoMagic API Piano"}
 
 
 @app.get("/")
 async def root():
-    return {"service": "PianoMagic API ByteDance", "version": "10.0.0"}
+    return {"service": "PianoMagic API Piano", "version": "12.0.0"}
 
 
 if __name__ == "__main__":
