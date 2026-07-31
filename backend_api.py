@@ -95,7 +95,7 @@ async def download_pdf(job_id: str):
 
 
 def limit_chord_span(notes, max_span):
-    """Удаляет крайние ноты, пока размах <= max_span. Удаляет тишее из крайних."""
+    """Удаляет крайние ноты, пока размах <= max_span."""
     if len(notes) <= 1:
         return notes
     notes = sorted(notes, key=lambda x: x["pitch"])
@@ -109,7 +109,7 @@ def limit_chord_span(notes, max_span):
 
 def process_audio(job_id: str, input_path: Path, xml_path: Path, pdf_path: Path):
     try:
-        logger.info(f"[{job_id}] === Начало v3.6.0 (полифония, 2 руки) ===")
+        logger.info(f"[{job_id}] === Начало v3.6.0 ===")
 
         from basic_pitch.inference import predict
         from music21 import (
@@ -118,14 +118,13 @@ def process_audio(job_id: str, input_path: Path, xml_path: Path, pdf_path: Path)
             tie, pitch as m21_pitch
         )
 
-        # 1. Basic Pitch
         _, _, note_events = predict(str(input_path))
         logger.info(f"[{job_id}] Всего нот: {len(note_events)}")
 
         if not note_events:
             raise ValueError("Ноты не найдены")
 
-        # 2. Фильтрация
+        # Фильтрация
         notes_raw = []
         for start, end, pitch_val, amp, _ in note_events:
             dur = end - start
@@ -147,9 +146,9 @@ def process_audio(job_id: str, input_path: Path, xml_path: Path, pdf_path: Path)
             raise ValueError("После фильтрации нот не осталось")
 
         avg_vel = sum(n["velocity"] for n in notes_raw) / len(notes_raw)
-        logger.info(f"[{job_id}] После фильтрации: {len(notes_raw)}, avg_vel={avg_vel:.1f}")
+        logger.info(f"[{job_id}] После фильтрации: {len(notes_raw)}")
 
-        # 3. Тональность
+        # Тональность
         try:
             from music21.analysis import discrete
             s_tmp = stream.Stream()
@@ -165,11 +164,10 @@ def process_audio(job_id: str, input_path: Path, xml_path: Path, pdf_path: Path)
             candidates = [0, 1, 2, 3, -1, -2, -3]
             best = min(candidates, key=lambda c: abs(c - sharps))
             detected_key = key.Key(m21_pitch.Pitch(sharps=best).name)
-            sharps = best
 
-        logger.info(f"[{job_id}] Тональность: {detected_key.name} ({sharps} знаков)")
+        logger.info(f"[{job_id}] Тональность: {detected_key.name}")
 
-        # 4. Квантизация
+        # Квантизация
         def quantize_ql(t):
             ql = t / SEC_PER_QUARTER
             return round(ql / GRID_8TH) * GRID_8TH
@@ -187,7 +185,7 @@ def process_audio(job_id: str, input_path: Path, xml_path: Path, pdf_path: Path)
                 "velocity": n["velocity"],
             })
 
-        # 5. Группировка по слотам и разделение на руки
+        # Группировка по слотам и разделение на руки
         slots = defaultdict(list)
         for n in quantized:
             slot = round(n["q_start"] / GRID_8TH) * GRID_8TH
@@ -200,7 +198,6 @@ def process_audio(job_id: str, input_path: Path, xml_path: Path, pdf_path: Path)
             notes = slots[slot]
             notes.sort(key=lambda x: x["velocity"], reverse=True)
 
-            # Уникальные pitch
             seen = set()
             unique = []
             for note in notes:
@@ -209,20 +206,17 @@ def process_audio(job_id: str, input_path: Path, xml_path: Path, pdf_path: Path)
                     unique.append(note)
             notes = unique
 
-            # Разделение: ≥ C4 → правая, < C4 → левая
             right_candidates = [n for n in notes if n["pitch"] >= 60]
             left_candidates = [n for n in notes if n["pitch"] < 60]
 
-            # === ПРАВАЯ РУКА ===
+            # Правая рука
             right = right_candidates[:RIGHT_POLY_MAX]
             right = limit_chord_span(right, MAX_CHORD_SPAN)
             for n in right:
                 right_events.append({**n, "q_start": slot})
 
-            # === ЛЕВАЯ РУКА ===
+            # Левая рука
             left = left_candidates[:LEFT_POLY_MAX]
-
-            # Фильтр m2 в левой руке
             left_sorted = sorted(left, key=lambda x: x["pitch"])
             skip = set()
             for i, a in enumerate(left_sorted):
@@ -239,7 +233,6 @@ def process_audio(job_id: str, input_path: Path, xml_path: Path, pdf_path: Path)
             left = [left_sorted[i] for i in range(len(left_sorted)) if i not in skip]
             left = left[:LEFT_POLY_MAX]
 
-            # M7 (11 полутонов) → октава
             for n in left:
                 for other in left:
                     if n is not other and abs(n["pitch"] - other["pitch"]) == 11:
@@ -250,9 +243,9 @@ def process_audio(job_id: str, input_path: Path, xml_path: Path, pdf_path: Path)
             for n in left:
                 left_events.append({**n, "q_start": slot})
 
-        logger.info(f"[{job_id}] Правая: {len(right_events)} нот/акк, Левая: {len(left_events)} нот/акк")
+        logger.info(f"[{job_id}] Правая: {len(right_events)}, Левая: {len(left_events)}")
 
-        # 6. Создание нотного текста
+        # Создание нотного текста
         def build_part(events, is_right):
             part = stream.Part()
             part.insert(0, instrument.Piano())
@@ -264,7 +257,6 @@ def process_audio(job_id: str, input_path: Path, xml_path: Path, pdf_path: Path)
             else:
                 part.insert(0, clef.BassClef())
 
-            # Группировка по тактам
             measures = defaultdict(list)
             for evt in events:
                 m_idx = int(evt["q_start"] // 4.0)
@@ -278,40 +270,12 @@ def process_audio(job_id: str, input_path: Path, xml_path: Path, pdf_path: Path)
                 measure = stream.Measure(number=m_idx + 1)
                 slot_notes = sorted(measures[m_idx], key=lambda x: x["offset"])
 
-                last_end = 0.0
-                prev_pitches = {}  # pitch -> note object for tie
-
-                for nd in slot_notes:
-                    off = nd["offset"]
-                    dur = min(nd["q_dur"], 4.0 - off)
-                    if dur < GRID_8TH:
-                        continue
-
-                    # Пауза
-                    gap = off - last_end
-                    if gap >= GRID_8TH:
-                        rest_ql = round(gap / GRID_8TH) * GRID_8TH
-                        rest_ql = min(rest_ql, 4.0 - last_end)
-                        if rest_ql >= GRID_8TH:
-                            r = m21_note.Rest()
-                            r.duration = m21_duration.Duration(quarterLength=rest_ql)
-                            measure.insert(last_end, r)
-                            last_end += rest_ql
-
-                    # Создаём ноту или аккорд
-                    # Собираем все ноты на этом offset (они уже сгруппированы по слотам,
-                    # но могут быть разные pitch на один offset)
-                    # На самом деле events уже по одной ноте, но мы можем собрать аккорд
-                    # если несколько нот на один offset
-                    pass  # будет ниже
-
-                # Пересобираем: группируем по offset внутри такта
+                # Группируем по offset для аккордов
                 offset_groups = defaultdict(list)
                 for nd in slot_notes:
                     offset_groups[nd["offset"]].append(nd)
 
                 last_end = 0.0
-                prev_objects = {}  # pitch -> last note/chord for tie
 
                 for off in sorted(offset_groups.keys()):
                     group = offset_groups[off]
@@ -330,10 +294,9 @@ def process_audio(job_id: str, input_path: Path, xml_path: Path, pdf_path: Path)
                             measure.insert(last_end, r)
                             last_end += rest_ql
 
-                    # Создаём элемент
+                    # Аккорд или нота
                     pitches = [g["pitch"] for g in group]
-                    velocities = [g["velocity"] for g in group]
-                    vel = max(velocities)
+                    vel = max(g["velocity"] for g in group)
 
                     if len(pitches) == 1:
                         n = m21_note.Note(midi=pitches[0])
@@ -343,36 +306,10 @@ def process_audio(job_id: str, input_path: Path, xml_path: Path, pdf_path: Path)
                     n.duration = m21_duration.Duration(quarterLength=dur)
                     n.volume.velocity = vel
 
-                    # Акцент
                     if vel > avg_vel * 1.3:
                         n.articulations.append(articulations.Accent())
 
-                    # Лиги для каждого pitch в аккорде
-                    for p in pitches:
-                        if p in prev_objects:
-                            prev = prev_objects[p]
-                            if prev.offset + prev.duration.quarterLength >= off - 0.01:
-                                if hasattr(prev, 'tie') and prev.tie:
-                                    if prev.tie.type == 'start':
-                                        pass  # уже есть
-                                    else:
-                                        prev.tie = tie.Tie("start")
-                                else:
-                                    prev.tie = tie.Tie("start")
-                                if hasattr(n, 'tie') and n.tie:
-                                    pass
-                                else:
-                                    n.tie = tie.Tie("stop")  # для аккорда — сложнее
-                                # music21 chord tie — применяем к pitch
-                                # Проще: не делаем лиги для аккордов, только моно
-                                pass
-
-                    # Упрощение: лиги только для монофонических переходов
-                    # (в полифонии лиги редко нужны для одного pitch)
-
                     measure.insert(off, n)
-                    for p in pitches:
-                        prev_objects[p] = n
                     last_end = off + dur
 
                 part.append(measure)
@@ -390,7 +327,6 @@ def process_audio(job_id: str, input_path: Path, xml_path: Path, pdf_path: Path)
         score.insert(0, right_part)
         score.insert(0, left_part)
 
-        # 7. MusicXML → PDF
         score.write("musicxml", str(xml_path))
         logger.info(f"[{job_id}] MusicXML записан")
 
