@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="PianoMagic API", version="3.2.2")
+app = FastAPI(title="PianoMagic API", version="3.2.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,8 +35,8 @@ jobs = {}
 BPM = 120
 SEC_PER_QUARTER = 60.0 / BPM
 GRID_8TH = 0.5
-MIN_AMP = 0.30
-MIN_DUR_SEC = 0.10
+MIN_AMP = 0.35
+MIN_DUR_SEC = 0.12
 MAX_DUR_QL = 4.0
 RIGHT_POLY_MAX = 4
 LEFT_POLY_MAX = 3
@@ -45,7 +45,7 @@ MAX_KEY_SHARPS = 3
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "version": "3.2.2"}
+    return {"status": "ok", "version": "3.2.3"}
 
 
 @app.post("/transcribe/file")
@@ -95,13 +95,12 @@ async def download_pdf(job_id: str):
 
 def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path):
     try:
-        logger.info(f"[{job_id}] === Начало v3.2.2 ===")
+        logger.info(f"[{job_id}] === Начало v3.2.3 ===")
 
         from basic_pitch.inference import predict
         from basic_pitch import ICASSP_2022_MODEL_PATH
 
         logger.info(f"[{job_id}] Модель: {ICASSP_2022_MODEL_PATH}")
-        logger.info(f"[{job_id}] Модель существует: {Path(ICASSP_2022_MODEL_PATH).exists()}")
 
         _, _, note_events = predict(str(input_path))
         logger.info(f"[{job_id}] Найдено нот: {len(note_events)}")
@@ -227,7 +226,7 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
         left_events = prepare_hand(left_notes, LEFT_POLY_MAX, False)
         logger.info(f"[{job_id}] Правая: {len(right_events)}, Левая: {len(left_events)}")
 
-        # 6. Создание партий — ИСПРАВЛЕННЫЙ build_part
+        # 6. Создание партий — ноты разбиваются по тактам, offset строго < 4.0
         def build_part(events, is_right):
             part = stream.Part()
             part.insert(0, instrument.Piano())
@@ -239,40 +238,44 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
 
             events.sort(key=lambda x: x["q_start"])
 
-            # Группировка по тактам с учётом переноса
+            # Разбиваем события по тактам
             measures = defaultdict(list)
             for evt in events:
                 start_ql = evt["q_start"]
                 dur_ql = evt["q_dur"]
-                # Нота может начинаться ровно на границе или пересекать такт
+                pitch = evt["pitch"]
+                vel = evt["velocity"]
+
                 m_idx = int(start_ql // 4.0)
                 m_offset = start_ql % 4.0
 
-                # Если нота начинается ровно на 4.0 — это начало следующего такта
-                if m_offset == 0.0 and start_ql > 0:
-                    m_idx = int(start_ql // 4.0)
+                # Если offset из-за округления стал 4.0 — переносим в следующий такт
+                if m_offset >= 3.999:
+                    m_idx += 1
+                    m_offset = 0.0
 
-                # Если нота пересекает границу такта — разбиваем
-                remaining_dur = dur_ql
-                current_m_idx = m_idx
-                current_offset = m_offset
+                remaining = dur_ql
+                current_m = m_idx
+                current_off = m_offset
 
-                while remaining_dur > 0 and current_m_idx < 1000:
-                    space_in_measure = 4.0 - current_offset
-                    chunk_dur = min(remaining_dur, space_in_measure)
-                    chunk_dur = max(GRID_8TH, round(chunk_dur / GRID_8TH) * GRID_8TH)
+                while remaining > 0.001 and current_m < 500:
+                    space = 4.0 - current_off
+                    chunk = min(remaining, space)
+                    # Округляем chunk до сетки
+                    chunk = round(chunk / GRID_8TH) * GRID_8TH
+                    chunk = max(GRID_8TH, chunk)
 
-                    if chunk_dur >= GRID_8TH:
-                        measures[current_m_idx].append({
-                            "offset": current_offset,
-                            "dur": chunk_dur,
-                            "pitch": evt["pitch"],
-                            "velocity": evt["velocity"],
+                    if chunk >= GRID_8TH and current_off < 4.0:
+                        measures[current_m].append({
+                            "offset": current_off,
+                            "dur": chunk,
+                            "pitch": pitch,
+                            "velocity": vel,
                         })
 
-                    remaining_dur -= chunk_dur
-                    current_m_idx += 1
-                    current_offset = 0.0
+                    remaining -= chunk
+                    current_m += 1
+                    current_off = 0.0
 
             # Собираем такты
             for m_idx in sorted(measures.keys()):
@@ -283,13 +286,13 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
                 last_end = 0.0
                 prev_notes = {}
 
-                for note_data in slot_notes:
-                    offset = note_data["offset"]
-                    dur = note_data["dur"]
-                    pitch = note_data["pitch"]
-                    vel = note_data["velocity"]
+                for nd in slot_notes:
+                    offset = nd["offset"]
+                    dur = nd["dur"]
+                    pitch = nd["pitch"]
+                    vel = nd["velocity"]
 
-                    # Пауза?
+                    # Пауза
                     gap = offset - last_end
                     if gap >= GRID_8TH:
                         rest_ql = round(gap / GRID_8TH) * GRID_8TH
@@ -300,9 +303,9 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
                             measure.insert(last_end, r)
                             last_end += rest_ql
 
-                    # Нота
+                    # Нота — не вставляем, если не влезает
                     dur = min(dur, 4.0 - offset)
-                    if dur < GRID_8TH:
+                    if dur < GRID_8TH or offset >= 4.0:
                         continue
 
                     n = m21_note.Note(midi=pitch)
@@ -327,7 +330,10 @@ def process_audio(job_id: str, input_path: Path, midi_path: Path, pdf_path: Path
 
                 part.append(measure)
 
-            part.makeBeams(inPlace=True)
+            try:
+                part.makeBeams(inPlace=True)
+            except Exception as e:
+                logger.warning(f"[{job_id}] makeBeams пропущен: {e}")
             return part
 
         right_part = build_part(right_events, True)
