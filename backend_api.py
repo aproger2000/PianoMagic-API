@@ -5,6 +5,7 @@ import subprocess
 import logging
 from pathlib import Path
 from collections import defaultdict
+from xml.etree.ElementTree import Element, SubElement, tostring
 
 from fastapi import FastAPI, File, UploadFile, BackgroundTasks, HTTPException
 from fastapi.responses import FileResponse
@@ -13,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="PianoMagic API", version="3.6.0")
+app = FastAPI(title="PianoMagic API", version="3.7.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -37,16 +38,17 @@ SEC_PER_QUARTER = 60.0 / BPM
 GRID_8TH = 0.5
 MIN_AMP = 0.30
 MIN_DUR_SEC = 0.10
-MAX_DUR_QL = 4.0
 RIGHT_POLY_MAX = 3
 LEFT_POLY_MAX = 3
-MAX_KEY_SHARPS = 3
-MAX_CHORD_SPAN = 12  # 1 октава
+MAX_CHORD_SPAN = 12
+DIVISIONS = 2  # quarter = 2, eighth = 1, half = 4, whole = 8
+
+NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "version": "3.6.0"}
+    return {"status": "ok", "version": "3.7.0"}
 
 
 @app.post("/transcribe/file")
@@ -94,8 +96,20 @@ async def download_pdf(job_id: str):
     )
 
 
+def midi_to_pitch(midi):
+    name = NOTE_NAMES[midi % 12]
+    octave = (midi // 12) - 1
+    if '#' in name:
+        return name[0], 1, octave
+    return name, 0, octave
+
+
+def dur_to_type(dur):
+    mapping = {8: 'whole', 6: 'half', 4: 'half', 3: 'quarter', 2: 'quarter', 1: 'eighth'}
+    return mapping.get(dur, 'quarter')
+
+
 def limit_chord_span(notes, max_span):
-    """Удаляет крайние ноты, пока размах <= max_span."""
     if len(notes) <= 1:
         return notes
     notes = sorted(notes, key=lambda x: x["pitch"])
@@ -107,17 +121,89 @@ def limit_chord_span(notes, max_span):
     return notes
 
 
+def build_musicxml(right_measures, left_measures, key_fifths=0):
+    """Generate MusicXML 3.1 from measure data."""
+    root = Element('score-partwise', {'version': '3.1'})
+
+    # Part list
+    plist = SubElement(root, 'part-list')
+    for pid, pname, abbrev in [('P1', 'Right Hand', 'R.H.'), ('P2', 'Left Hand', 'L.H.')]:
+        sp = SubElement(plist, 'score-part', {'id': pid})
+        SubElement(sp, 'part-name').text = pname
+        SubElement(sp, 'part-abbreviation').text = abbrev
+
+    def add_part(pid, measures, clef_sign, clef_line):
+        part = SubElement(root, 'part', {'id': pid})
+        for m_idx, events in enumerate(measures):
+            measure = SubElement(part, 'measure', {'number': str(m_idx + 1)})
+
+            if m_idx == 0:
+                attr = SubElement(measure, 'attributes')
+                SubElement(attr, 'divisions').text = str(DIVISIONS)
+                k = SubElement(attr, 'key')
+                SubElement(k, 'fifths').text = str(key_fifths)
+                t = SubElement(attr, 'time')
+                SubElement(t, 'beats').text = '4'
+                SubElement(t, 'beat-type').text = '4'
+                c = SubElement(attr, 'clef')
+                SubElement(c, 'sign').text = clef_sign
+                SubElement(c, 'line').text = str(clef_line)
+
+            events = sorted(events, key=lambda x: x['offset'])
+            last_end = 0
+
+            for evt in events:
+                off = evt['offset']
+                dur = evt['dur']
+                pitches = evt['pitches']
+
+                # Rest for gap
+                gap = off - last_end
+                if gap >= 1:
+                    r = SubElement(measure, 'note')
+                    SubElement(r, 'rest')
+                    SubElement(r, 'duration').text = str(gap)
+                    SubElement(r, 'type').text = dur_to_type(gap)
+
+                # Note / Chord
+                for i, p in enumerate(pitches):
+                    n = SubElement(measure, 'note')
+                    if i > 0:
+                        SubElement(n, 'chord')
+
+                    step, alter, octv = midi_to_pitch(p)
+                    pitch_el = SubElement(n, 'pitch')
+                    SubElement(pitch_el, 'step').text = step
+                    if alter != 0:
+                        SubElement(pitch_el, 'alter').text = str(alter)
+                    SubElement(pitch_el, 'octave').text = str(octv)
+
+                    SubElement(n, 'duration').text = str(dur)
+                    SubElement(n, 'type').text = dur_to_type(dur)
+
+                last_end = off + dur
+
+            # Fill measure to 8 divisions
+            fill = 8 - last_end
+            if fill >= 1:
+                r = SubElement(measure, 'note')
+                SubElement(r, 'rest')
+                SubElement(r, 'duration').text = str(fill)
+                SubElement(r, 'type').text = dur_to_type(fill)
+
+    add_part('P1', right_measures, 'G', 2)
+    add_part('P2', left_measures, 'F', 4)
+
+    xml_str = tostring(root, encoding='unicode')
+    doctype = '<!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 3.1 Partwise//EN" "http://www.musicxml.org/dtds/partwise.dtd">\n'
+    return '<?xml version="1.0" encoding="UTF-8"?>\n' + doctype + xml_str
+
+
 def process_audio(job_id: str, input_path: Path, xml_path: Path, pdf_path: Path):
     try:
-        logger.info(f"[{job_id}] === Начало v3.6.0 ===")
+        logger.info(f"[{job_id}] === Начало v3.7.0 (ручной MusicXML) ===")
 
         from basic_pitch.inference import predict
-        from music21 import (
-            stream, instrument, note as m21_note, chord as m21_chord, clef,
-            tempo, meter, key, duration as m21_duration, articulations,
-            tie, pitch as m21_pitch
-        )
-
         _, _, note_events = predict(str(input_path))
         logger.info(f"[{job_id}] Всего нот: {len(note_events)}")
 
@@ -145,47 +231,26 @@ def process_audio(job_id: str, input_path: Path, xml_path: Path, pdf_path: Path)
         if not notes_raw:
             raise ValueError("После фильтрации нот не осталось")
 
-        avg_vel = sum(n["velocity"] for n in notes_raw) / len(notes_raw)
         logger.info(f"[{job_id}] После фильтрации: {len(notes_raw)}")
 
-        # Тональность
-        try:
-            from music21.analysis import discrete
-            s_tmp = stream.Stream()
-            for n in notes_raw:
-                s_tmp.append(m21_note.Note(midi=n["pitch"], quarterLength=0.5))
-            analyzer = discrete.KrumhanslSchmuckler()
-            detected_key = analyzer.getSolution(s_tmp)
-        except Exception:
-            detected_key = key.Key("C")
-
-        sharps = detected_key.sharps
-        if abs(sharps) > MAX_KEY_SHARPS:
-            candidates = [0, 1, 2, 3, -1, -2, -3]
-            best = min(candidates, key=lambda c: abs(c - sharps))
-            detected_key = key.Key(m21_pitch.Pitch(sharps=best).name)
-
-        logger.info(f"[{job_id}] Тональность: {detected_key.name}")
-
         # Квантизация
-        def quantize_ql(t):
-            ql = t / SEC_PER_QUARTER
-            return round(ql / GRID_8TH) * GRID_8TH
+        def q(t):
+            return round((t / SEC_PER_QUARTER) / GRID_8TH) * GRID_8TH
 
         quantized = []
         for n in notes_raw:
-            qs = quantize_ql(n["start"])
-            qe = quantize_ql(n["end"])
+            qs = q(n["start"])
+            qe = q(n["end"])
             qdur = max(GRID_8TH, round((qe - qs) / GRID_8TH) * GRID_8TH)
-            qdur = min(MAX_DUR_QL, qdur)
+            qdur = min(4.0, qdur)
             quantized.append({
                 "q_start": qs,
-                "q_dur": qdur,
+                "dur_ql": qdur,
                 "pitch": n["pitch"],
                 "velocity": n["velocity"],
             })
 
-        # Группировка по слотам и разделение на руки
+        # Слоты (1/8)
         slots = defaultdict(list)
         for n in quantized:
             slot = round(n["q_start"] / GRID_8TH) * GRID_8TH
@@ -206,17 +271,21 @@ def process_audio(job_id: str, input_path: Path, xml_path: Path, pdf_path: Path)
                     unique.append(note)
             notes = unique
 
-            right_candidates = [n for n in notes if n["pitch"] >= 60]
-            left_candidates = [n for n in notes if n["pitch"] < 60]
+            right_cand = [n for n in notes if n["pitch"] >= 60]
+            left_cand = [n for n in notes if n["pitch"] < 60]
 
             # Правая рука
-            right = right_candidates[:RIGHT_POLY_MAX]
+            right = right_cand[:RIGHT_POLY_MAX]
             right = limit_chord_span(right, MAX_CHORD_SPAN)
-            for n in right:
-                right_events.append({**n, "q_start": slot})
+            if right:
+                right_events.append({
+                    "start": slot,
+                    "dur": right[0]["dur_ql"],
+                    "pitches": [n["pitch"] for n in right]
+                })
 
             # Левая рука
-            left = left_candidates[:LEFT_POLY_MAX]
+            left = left_cand[:LEFT_POLY_MAX]
             left_sorted = sorted(left, key=lambda x: x["pitch"])
             skip = set()
             for i, a in enumerate(left_sorted):
@@ -240,96 +309,43 @@ def process_audio(job_id: str, input_path: Path, xml_path: Path, pdf_path: Path)
                             n["pitch"] += 12
 
             left = limit_chord_span(left, MAX_CHORD_SPAN)
-            for n in left:
-                left_events.append({**n, "q_start": slot})
+            if left:
+                left_events.append({
+                    "start": slot,
+                    "dur": left[0]["dur_ql"],
+                    "pitches": [n["pitch"] for n in left]
+                })
 
         logger.info(f"[{job_id}] Правая: {len(right_events)}, Левая: {len(left_events)}")
 
-        # Создание нотного текста
-        def build_part(events, is_right):
-            part = stream.Part()
-            part.insert(0, instrument.Piano())
-            part.insert(0, detected_key)
-            part.insert(0, meter.TimeSignature("4/4"))
-            part.insert(0, tempo.MetronomeMark(number=BPM))
-            if is_right:
-                part.insert(0, clef.TrebleClef())
-            else:
-                part.insert(0, clef.BassClef())
-
+        # В такты (4/4 = 8 divisions)
+        def to_measures(events):
             measures = defaultdict(list)
             for evt in events:
-                m_idx = int(evt["q_start"] // 4.0)
-                off = evt["q_start"] % 4.0
+                m = int(evt["start"] // 4.0)
+                off = evt["start"] % 4.0
                 if off >= 3.999:
-                    m_idx += 1
+                    m += 1
                     off = 0.0
-                measures[m_idx].append({**evt, "offset": off})
+                dur_div = max(1, int(round(evt["dur"] * DIVISIONS)))
+                measures[m].append({
+                    "offset": int(round(off * DIVISIONS)),
+                    "dur": dur_div,
+                    "pitches": evt["pitches"],
+                })
+            return [measures[i] for i in sorted(measures.keys())]
 
-            for m_idx in sorted(measures.keys()):
-                measure = stream.Measure(number=m_idx + 1)
-                slot_notes = sorted(measures[m_idx], key=lambda x: x["offset"])
+        right_m = to_measures(right_events)
+        left_m = to_measures(left_events)
 
-                # Группируем по offset для аккордов
-                offset_groups = defaultdict(list)
-                for nd in slot_notes:
-                    offset_groups[nd["offset"]].append(nd)
+        # MusicXML
+        xml_content = build_musicxml(right_m, left_m, key_fifths=0)
+        with open(xml_path, 'w', encoding='utf-8') as f:
+            f.write(xml_content)
 
-                last_end = 0.0
-
-                for off in sorted(offset_groups.keys()):
-                    group = offset_groups[off]
-                    dur = min(group[0]["q_dur"], 4.0 - off)
-                    if dur < GRID_8TH:
-                        continue
-
-                    # Пауза
-                    gap = off - last_end
-                    if gap >= GRID_8TH:
-                        rest_ql = round(gap / GRID_8TH) * GRID_8TH
-                        rest_ql = min(rest_ql, 4.0 - last_end)
-                        if rest_ql >= GRID_8TH:
-                            r = m21_note.Rest()
-                            r.duration = m21_duration.Duration(quarterLength=rest_ql)
-                            measure.insert(last_end, r)
-                            last_end += rest_ql
-
-                    # Аккорд или нота
-                    pitches = [g["pitch"] for g in group]
-                    vel = max(g["velocity"] for g in group)
-
-                    if len(pitches) == 1:
-                        n = m21_note.Note(midi=pitches[0])
-                    else:
-                        n = m21_chord.Chord(pitches)
-
-                    n.duration = m21_duration.Duration(quarterLength=dur)
-                    n.volume.velocity = vel
-
-                    if vel > avg_vel * 1.3:
-                        n.articulations.append(articulations.Accent())
-
-                    measure.insert(off, n)
-                    last_end = off + dur
-
-                part.append(measure)
-
-            try:
-                part.makeBeams(inPlace=True)
-            except Exception:
-                pass
-            return part
-
-        right_part = build_part(right_events, True)
-        left_part = build_part(left_events, False)
-
-        score = stream.Score()
-        score.insert(0, right_part)
-        score.insert(0, left_part)
-
-        score.write("musicxml", str(xml_path))
         logger.info(f"[{job_id}] MusicXML записан")
 
+        # MuseScore3 → PDF
         result = subprocess.run(
             ["musescore3", "-o", str(pdf_path), str(xml_path)],
             capture_output=True,
