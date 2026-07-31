@@ -1,5 +1,6 @@
 """
-PianoMagic API — Piano Edition (2 руки, квантизация)
+PianoMagic API — ByteDance Piano Transcription Edition
+FastAPI + ByteDance Piano Transcription (PyTorch) + music21
 """
 
 import asyncio
@@ -18,7 +19,7 @@ from music21 import (
     clef, layout, metadata
 )
 
-app = FastAPI(title="PianoMagic API Piano", version="9.0.0")
+app = FastAPI(title="PianoMagic API ByteDance", version="10.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -37,29 +38,33 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 
 MAX_FILE_SIZE = 50 * 1024 * 1024
 jobs = {}
-_basic_pitch_loaded = False
 
-def get_predict():
-    global _basic_pitch_loaded
-    if not _basic_pitch_loaded:
-        print("[INIT] Loading Basic Pitch...")
-        from basic_pitch.inference import predict as _predict
-        _basic_pitch_loaded = True
+_transcriptor = None
+
+def get_transcriptor():
+    global _transcriptor
+    if _transcriptor is None:
+        print("[INIT] Loading ByteDance Piano Transcription...")
+        from piano_transcription_inference import PianoTranscription
+        _transcriptor = PianoTranscription(device='cpu', checkpoint_path=None)
         print("[INIT] Loaded")
-        return _predict
-    from basic_pitch.inference import predict as _predict
-    return _predict
+    return _transcriptor
+
 
 def transcribe_sync(input_path: Path, midi_path: Path):
     print(f"[TRANSCRIBE] {input_path}")
-    predict_func = get_predict()
-    _, midi_data, _ = predict_func(str(input_path))
-    midi_data.write(str(midi_path))
+    from piano_transcription_inference import load_audio, sample_rate
+
+    audio, _ = load_audio(str(input_path), sr=sample_rate, mono=True)
+    transcriptor = get_transcriptor()
+    transcriptor.transcribe(audio, str(midi_path))
     print(f"[TRANSCRIBE] MIDI done")
+
 
 def quantize_duration(d: float) -> float:
     std = [4.0, 3.0, 2.0, 1.5, 1.0, 0.75, 0.5, 0.375, 0.25, 0.125]
     return min(std, key=lambda x: abs(x - d))
+
 
 def process_midi_to_sheet(midi_path: Path, pdf_path: Path, title: str):
     print(f"[SHEET] {midi_path}")
@@ -149,15 +154,16 @@ def process_midi_to_sheet(midi_path: Path, pdf_path: Path, title: str):
             [mscore, str(xml_path), "-o", str(pdf_path)],
             check=True, capture_output=True, timeout=60, env=env
         )
-        print(f"[SHEET] MuseScore PDF done")
+        print(f"[SHEET] MuseScore done")
     else:
         score.write("lily.pdf", fp=str(pdf_path))
-        print(f"[SHEET] LilyPond PDF done")
+        print(f"[SHEET] LilyPond done")
+
 
 async def process_audio_async(job_id: str, input_path: Path):
     try:
         jobs[job_id]["status"] = "transcribing"
-        jobs[job_id]["message"] = "AI анализирует аудио..."
+        jobs[job_id]["message"] = "ByteDance AI анализирует фортепиано..."
 
         job_dir = TEMP_DIR / job_id
         job_dir.mkdir(exist_ok=True)
@@ -191,6 +197,7 @@ async def process_audio_async(job_id: str, input_path: Path):
         jobs[job_id]["status"] = "error"
         jobs[job_id]["message"] = str(e)
 
+
 @app.post("/transcribe/file")
 async def transcribe_file(file: UploadFile = File(...)):
     content = await file.read()
@@ -223,11 +230,13 @@ async def transcribe_file(file: UploadFile = File(...)):
         "message": "Обработка начата"
     })
 
+
 @app.get("/jobs/{job_id}")
 async def get_job_status(job_id: str):
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Задание не найдено")
     return JSONResponse(content=jobs[job_id])
+
 
 @app.get("/download/{filename}")
 async def download_file(filename: str):
@@ -236,13 +245,16 @@ async def download_file(filename: str):
         raise HTTPException(status_code=404, detail="Файл не найден")
     return FileResponse(path=file_path, filename=filename, media_type="application/pdf")
 
+
 @app.get("/health")
 async def health_check():
-    return {"status": "ok", "service": "PianoMagic API Piano"}
+    return {"status": "ok", "service": "PianoMagic API ByteDance"}
+
 
 @app.get("/")
 async def root():
-    return {"service": "PianoMagic API Piano", "version": "9.0.0"}
+    return {"service": "PianoMagic API ByteDance", "version": "10.0.0"}
+
 
 if __name__ == "__main__":
     import uvicorn
