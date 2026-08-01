@@ -3,7 +3,6 @@ import uuid
 import shutil
 import subprocess
 import logging
-import json
 import struct
 import math
 from pathlib import Path
@@ -13,11 +12,13 @@ from fastapi import FastAPI, File, UploadFile, BackgroundTasks, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
+from scipy import signal
+from scipy.ndimage import median_filter
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="PianoMagic API", version="4.2.1")
+app = FastAPI(title="PianoMagic API", version="4.2.2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,9 +42,10 @@ HOP_MS = 50
 HOP = int(SR * HOP_MS / 1000)
 N_FFT = 4096
 MIN_AMP = 0.05
-NOTE_THRESHOLD = 0.12
-MELODY_MIN_FREQ = 250
-MELODY_MAX_FREQ = 1200
+NOTE_THRESHOLD = 0.15
+MELODY_MIN_FREQ = 300
+MELODY_MAX_FREQ = 1500
+HPF_CUTOFF = 500
 DIVISIONS = 2
 
 NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
@@ -62,7 +64,7 @@ STAGES = {
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "version": "4.2.1"}
+    return {"status": "ok", "version": "4.2.2"}
 
 
 @app.post("/analyze")
@@ -192,6 +194,38 @@ def read_audio(path):
     return np.frombuffer(result.stdout, dtype=np.float32)
 
 
+def apply_hpf(audio, cutoff, sr):
+    nyq = sr / 2.0
+    b, a = signal.butter(4, cutoff / nyq, btype='high', analog=False)
+    return signal.filtfilt(b, a, audio)
+
+
+def compute_spectrogram(audio, sr, n_fft=2048, hop=512):
+    frames = []
+    window = np.hanning(n_fft)
+    for i in range(0, len(audio) - n_fft, hop):
+        frame = audio[i:i + n_fft] * window
+        spec = np.abs(np.fft.rfft(frame))
+        frames.append(spec)
+    if not frames:
+        return np.zeros((n_fft // 2 + 1, 1))
+    spec = np.array(frames).T  # (freqs, time)
+
+    # Log scale, clip dynamic range to 60 dB
+    spec_db = 20 * np.log10(spec + 1e-10)
+    vmax = spec_db.max()
+    spec_db = np.clip(spec_db, vmax - 60, vmax)
+    spec_db = (spec_db - spec_db.min()) / (spec_db.max() - spec_db.min() + 1e-10)
+
+    # Downsample for transfer: target ~128 freq bins x ~200 time frames
+    freq_step = max(1, spec_db.shape[0] // 128)
+    time_step = max(1, spec_db.shape[1] // 200)
+    spec_db = spec_db[::freq_step, ::time_step]
+
+    # Convert to uint8 for compact JSON
+    return (spec_db * 255).astype(np.uint8)
+
+
 def freq_to_midi(freq):
     if freq <= 0:
         return 0
@@ -222,86 +256,11 @@ def find_musescore():
     return None
 
 
-def find_fundamental_hps(spectrum, freqs, min_f, max_f):
-    """Harmonic Product Spectrum для поиска фундаментала мелодии"""
-    mask = (freqs >= min_f) & (freqs <= max_f)
-    mel_freqs = freqs[mask]
-    mel_spec = spectrum[mask]
-
-    if len(mel_spec) == 0:
-        return None, 0
-
-    # HPS: умножаем спектр на уменьшенные копии (гребенка гармоник)
-    hps = mel_spec.copy()
-    for div in [2, 3, 4]:
-        downsampled = mel_spec[::div]
-        if len(downsampled) < len(hps):
-            hps[:len(downsampled)] *= downsampled
-        else:
-            hps *= downsampled[:len(hps)]
-
-    # Находим топ-5 пиков
-    spec_copy = hps.copy()
-    peaks = []
-    for _ in range(5):
-        if len(spec_copy) == 0:
-            break
-        idx = np.argmax(spec_copy)
-        peaks.append(idx)
-        left = max(0, idx - 5)
-        right = min(len(spec_copy), idx + 6)
-        spec_copy[left:right] = 0
-
-    # Выбираем кандидата с лучшей гармонической поддержкой в оригинальном спектре
-    best_freq = None
-    best_score = 0
-
-    for idx in peaks:
-        freq = mel_freqs[idx]
-        amp = mel_spec[idx]
-        score = amp
-        # Проверяем гармоники в оригинальном спектре
-        for h in [2, 3, 4]:
-            hf = freq * h
-            if hf > freqs[-1]:
-                break
-            h_idx = np.argmin(np.abs(freqs - hf))
-            if h_idx < len(spectrum):
-                score += spectrum[h_idx] * 0.3
-
-        if score > best_score:
-            best_score = score
-            best_freq = freq
-
-    if best_freq is None:
-        return None, 0
-
-    # Нормализуем амплитуду относительно глобального максимума
-    global_max = np.max(spectrum) + 1e-10
-    amp_norm = min(1.0, best_score / global_max)
-    return best_freq, amp_norm
-
-
-def compute_spectrogram(audio, n_fft=2048, hop=512):
-    """Вычисляем 2D-спектрограмму для визуализации"""
-    frames = []
-    window = np.hanning(n_fft)
-    for i in range(0, len(audio) - n_fft, hop):
-        frame = audio[i:i + n_fft] * window
-        spec = np.abs(np.fft.rfft(frame))
-        frames.append(spec)
-    if not frames:
-        return np.zeros((n_fft // 2 + 1, 1))
-    return np.array(frames).T  # shape: (freqs, time)
-
-
 def generate_wav(notes, wav_path, sr=22050):
-    """Синтезируем WAV из нот для сравнения с оригиналом"""
     if not notes:
         return
-
     total_dur = max(n["start"] + n["dur"] for n in notes)
-    total_samples = int(total_dur * sr) + sr  # +1s запас
+    total_samples = int(total_dur * sr) + sr
     audio = np.zeros(total_samples, dtype=np.float32)
 
     for n in notes:
@@ -312,12 +271,10 @@ def generate_wav(notes, wav_path, sr=22050):
             continue
 
         t = np.linspace(0, n["dur"], dur_samples, endpoint=False)
-        # Синтез с обертонами для более естественного звука
         wave = 0.6 * np.sin(2 * np.pi * freq * t)
         wave += 0.2 * np.sin(2 * np.pi * freq * 2 * t)
         wave += 0.1 * np.sin(2 * np.pi * freq * 3 * t)
 
-        # ADSR-огибающая
         attack = int(0.02 * sr)
         release = int(0.1 * sr)
         env = np.ones(dur_samples)
@@ -330,22 +287,19 @@ def generate_wav(notes, wav_path, sr=22050):
         actual = end - start_sample
         audio[start_sample:end] += wave[:actual] * env[:actual] * 0.3
 
-    # Нормализация
     peak = np.max(np.abs(audio))
     if peak > 0:
         audio = audio / peak * 0.95
 
-    # Запись WAV
     audio_int16 = (audio * 32767).astype(np.int16)
     with open(wav_path, 'wb') as f:
-        # WAV header
         f.write(b'RIFF')
         f.write(struct.pack('<I', 36 + len(audio_int16) * 2))
         f.write(b'WAVE')
         f.write(b'fmt ')
         f.write(struct.pack('<I', 16))
-        f.write(struct.pack('<H', 1))  # PCM
-        f.write(struct.pack('<H', 1))  # mono
+        f.write(struct.pack('<H', 1))
+        f.write(struct.pack('<H', 1))
         f.write(struct.pack('<I', sr))
         f.write(struct.pack('<I', sr * 2))
         f.write(struct.pack('<H', 2))
@@ -364,38 +318,43 @@ def process_audio(job_id: str, input_path: Path):
         if len(audio) < N_FFT:
             raise ValueError("Аудио слишком короткое")
 
-        # Спектрограмма для визуализации
+        # 1. Compute spectrogram from original (for visualization)
         set_stage(job_id, "fft")
-        spec = compute_spectrogram(audio, n_fft=2048, hop=512)
-        # Логарифмическая шкала, нормализация
-        spec_db = 20 * np.log10(spec + 1e-10)
-        spec_db = spec_db - spec_db.min()
-        if spec_db.max() > 0:
-            spec_db = spec_db / spec_db.max()
+        spec_uint8 = compute_spectrogram(audio, SR)
+        spec_list = spec_uint8.tolist()
 
-        # Прореживаем по частоте (берём каждую 4-ю) и времени (каждую 2-ю)
-        spec_db = spec_db[::4, ::2]
+        # 2. Apply HPF to remove bass accompaniment
+        audio_hp = apply_hpf(audio, HPF_CUTOFF, SR)
 
-        # Конвертируем в список для JSON
-        spec_list = spec_db.tolist()
-
-        # FFT-анализ мелодии
+        # 3. FFT analysis on filtered audio
         freqs = np.fft.rfftfreq(N_FFT, 1 / SR)
         frames = []
 
-        for i in range(0, len(audio) - N_FFT, HOP):
-            frame = audio[i:i + N_FFT] * np.hanning(N_FFT)
+        for i in range(0, len(audio_hp) - N_FFT, HOP):
+            frame = audio_hp[i:i + N_FFT] * np.hanning(N_FFT)
             spectrum = np.abs(np.fft.rfft(frame))
-            peak_freq, peak_amp = find_fundamental_hps(spectrum, freqs, MELODY_MIN_FREQ, MELODY_MAX_FREQ)
-            if peak_freq is None:
+
+            mask = (freqs >= MELODY_MIN_FREQ) & (freqs <= MELODY_MAX_FREQ)
+            mel_freqs = freqs[mask]
+            mel_spec = spectrum[mask]
+
+            if len(mel_spec) == 0:
                 continue
 
+            idx = np.argmax(mel_spec)
+            peak_freq = mel_freqs[idx]
+            peak_amp = mel_spec[idx]
+
+            global_max = np.max(spectrum) + 1e-10
+            amp_norm = min(1.0, peak_amp / global_max)
             time = i / SR
+            midi = int(round(freq_to_midi(peak_freq)))
+
             frames.append({
                 "time": round(time, 3),
                 "freq": round(peak_freq, 1),
-                "amp": round(peak_amp, 3),
-                "midi": int(round(freq_to_midi(peak_freq)))
+                "amp": round(amp_norm, 3),
+                "midi": midi
             })
 
         if not frames:
@@ -404,19 +363,15 @@ def process_audio(job_id: str, input_path: Path):
         set_stage(job_id, "harmonic")
         melody_raw = [f for f in frames if f["amp"] >= MIN_AMP]
 
-        # Медианный фильтр (окно 7)
-        if len(melody_raw) > 7:
+        # Median filter (size 11 = ~550ms)
+        if len(melody_raw) > 11:
             pitches = [m["midi"] for m in melody_raw]
-            smoothed = []
-            for i in range(len(pitches)):
-                window = pitches[max(0, i - 3):min(len(pitches), i + 4)]
-                smoothed.append(int(np.median(window)))
+            smoothed = median_filter(pitches, size=11)
             for i, m in enumerate(melody_raw):
-                m["midi"] = smoothed[i]
+                m["midi"] = int(smoothed[i])
 
-        # Гистерезис: убираем очень короткие артефакты
-        HYSTERESIS_MS = 0.12
-        min_frames = int(HYSTERESIS_MS / (HOP_MS / 1000))
+        # Hysteresis: min 5 frames (~250ms)
+        min_frames = 5
         filtered = []
         if melody_raw:
             run_start = 0
@@ -462,11 +417,11 @@ def process_audio(job_id: str, input_path: Path):
         if not notes:
             raise ValueError("Мелодия не выделена")
 
-        # Ограничиваем диапазон пианино, не сдвигая октавы
+        # Clamp to piano range without octave shifting
         for n in notes:
             n["pitch"] = max(21, min(108, n["pitch"]))
 
-        # Убираем дубли одинаковых соседних нот
+        # Deduplicate adjacent same pitches
         deduped = [notes[0]]
         for n in notes[1:]:
             if n["pitch"] != deduped[-1]["pitch"]:
@@ -489,7 +444,6 @@ def process_audio(job_id: str, input_path: Path):
             })
 
         set_stage(job_id, "render")
-        # Генерируем WAV сразу
         wav_path = Path(jobs[job_id]["wav_path"])
         generate_wav(quantized, wav_path)
 
