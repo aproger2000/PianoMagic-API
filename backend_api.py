@@ -15,7 +15,7 @@ import numpy as np
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="PianoMagic API", version="4.1.0")
+app = FastAPI(title="PianoMagic API", version="4.1.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -46,10 +46,20 @@ DIVISIONS = 2
 
 NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
+STAGES = {
+    "upload":    {"text": "Загрузка файла...",          "progress": 10},
+    "read":      {"text": "Чтение аудио (ffmpeg)...",   "progress": 20},
+    "fft":       {"text": "FFT-анализ (50мс фреймы)...","progress": 40},
+    "harmonic":  {"text": "Подавление гармоник...",     "progress": 55},
+    "smooth":    {"text": "Сглаживание мелодии...",     "progress": 70},
+    "quantize":  {"text": "Квантизация нот...",         "progress": 85},
+    "done":      {"text": "Готово!",                    "progress": 100},
+}
+
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "version": "4.1.0"}
+    return {"status": "ok", "version": "4.1.1"}
 
 
 @app.post("/analyze")
@@ -66,6 +76,7 @@ async def analyze(background_tasks: BackgroundTasks, file: UploadFile = File(...
 
     jobs[job_id] = {
         "status": "processing",
+        "stage": "upload",
         "input_path": str(input_path),
         "pdf_path": str(job_dir / "output.pdf"),
         "xml_path": str(job_dir / "output.xml"),
@@ -82,7 +93,16 @@ async def analyze(background_tasks: BackgroundTasks, file: UploadFile = File(...
 async def get_status(job_id: str):
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    return {"job_id": job_id, "status": jobs[job_id]["status"], "error": jobs[job_id].get("error")}
+    j = jobs[job_id]
+    stage_info = STAGES.get(j.get("stage", "upload"), STAGES["upload"])
+    return {
+        "job_id": job_id,
+        "status": j["status"],
+        "stage": j.get("stage", "upload"),
+        "stage_text": stage_info["text"],
+        "progress": stage_info["progress"],
+        "error": j.get("error"),
+    }
 
 
 @app.get("/melody/{job_id}")
@@ -134,6 +154,12 @@ async def download_pdf(job_id: str):
     return FileResponse(pdf_path, media_type="application/pdf", filename=f"PianoMagic_{job_id}.pdf")
 
 
+def set_stage(job_id, stage):
+    if job_id in jobs:
+        jobs[job_id]["stage"] = stage
+        logger.info(f"[{job_id}] Stage: {stage}")
+
+
 def read_audio(path):
     cmd = ['ffmpeg', '-y', '-i', str(path), '-ar', str(SR), '-ac', '1', '-f', 'f32le', '-']
     result = subprocess.run(cmd, capture_output=True)
@@ -166,7 +192,6 @@ def dur_info(dur):
 
 
 def find_fundamental(spectrum, freqs, min_f, max_f):
-    """Находит fundamental frequency с подавлением гармоник."""
     mask = (freqs >= min_f) & (freqs <= max_f)
     mel_freqs = freqs[mask]
     mel_spec = spectrum[mask]
@@ -174,7 +199,6 @@ def find_fundamental(spectrum, freqs, min_f, max_f):
     if len(mel_spec) == 0:
         return None, 0
 
-    # Находим топ-5 пиков
     peak_indices = []
     spec_copy = mel_spec.copy()
     for _ in range(5):
@@ -182,7 +206,6 @@ def find_fundamental(spectrum, freqs, min_f, max_f):
             break
         idx = np.argmax(spec_copy)
         peak_indices.append(idx)
-        # Обнуляем окрестности
         left = max(0, idx - 3)
         right = min(len(spec_copy), idx + 4)
         spec_copy[left:right] = 0
@@ -191,57 +214,47 @@ def find_fundamental(spectrum, freqs, min_f, max_f):
     for idx in peak_indices:
         freq = mel_freqs[idx]
         amp = mel_spec[idx]
-
-        # Проверяем, не является ли гармоникой
         is_harmonic = False
         for div in [2, 3, 4]:
             fundamental = freq / div
             if fundamental < min_f:
                 continue
-            # Ищем ближайший бин
             f_idx = np.argmin(np.abs(mel_freqs - fundamental))
             if f_idx < len(mel_spec) and mel_spec[f_idx] > amp * 0.15:
-                # Есть энергия на fundamental — значит текущий пик гармоника
                 is_harmonic = True
-                # Заменяем на fundamental
                 candidates.append((mel_freqs[f_idx], mel_spec[f_idx]))
                 break
-
         if not is_harmonic:
             candidates.append((freq, amp))
 
     if not candidates:
         return None, 0
-
-    # Берём кандидата с максимальной амплитудой
     best = max(candidates, key=lambda x: x[1])
     return best[0], best[1]
 
 
 def process_audio(job_id: str, input_path: Path):
     try:
-        logger.info(f"[{job_id}] === FFT v4.1.0 (harmonic suppression) ===")
+        set_stage(job_id, "read")
         audio = read_audio(input_path)
         duration = len(audio) / SR
-        logger.info(f"[{job_id}] Аудио: {duration:.1f}s")
 
         if len(audio) < N_FFT:
             raise ValueError("Аудио слишком короткое")
 
+        set_stage(job_id, "fft")
         freqs = np.fft.rfftfreq(N_FFT, 1 / SR)
-
         frames = []
+
         for i in range(0, len(audio) - N_FFT, HOP):
             frame = audio[i:i + N_FFT] * np.hanning(N_FFT)
             spectrum = np.abs(np.fft.rfft(frame))
-
             peak_freq, peak_amp = find_fundamental(spectrum, freqs, MELODY_MIN_FREQ, MELODY_MAX_FREQ)
             if peak_freq is None:
                 continue
 
             global_max = np.max(spectrum) + 1e-10
             amp_norm = min(1.0, peak_amp / global_max)
-
             time = i / SR
             frames.append({
                 "time": round(time, 3),
@@ -250,15 +263,13 @@ def process_audio(job_id: str, input_path: Path):
                 "midi": int(round(freq_to_midi(peak_freq)))
             })
 
-        logger.info(f"[{job_id}] Фреймов: {len(frames)}")
-
         if not frames:
             raise ValueError("Не удалось извлечь мелодию")
 
-        # Фильтр по амплитуде
+        set_stage(job_id, "harmonic")
         melody_raw = [f for f in frames if f["amp"] >= MIN_AMP]
 
-        # Медианный фильтр (окно 7)
+        # Медианный фильтр
         if len(melody_raw) > 7:
             pitches = [m["midi"] for m in melody_raw]
             smoothed = []
@@ -268,7 +279,7 @@ def process_audio(job_id: str, input_path: Path):
             for i, m in enumerate(melody_raw):
                 m["midi"] = smoothed[i]
 
-        # === ГИСТЕРЕЗИС: убираем кратковременные скачки (< 150мс) ===
+        # Гистерезис
         HYSTERESIS_MS = 0.15
         min_frames = int(HYSTERESIS_MS / (HOP_MS / 1000))
         filtered = []
@@ -283,16 +294,13 @@ def process_audio(job_id: str, input_path: Path):
                             filtered.append(melody_raw[j])
                     run_start = i
                     run_pitch = melody_raw[i]["midi"]
-            # последний run
             run_len = len(melody_raw) - run_start
             if run_len >= min_frames:
                 for j in range(run_start, len(melody_raw)):
                     filtered.append(melody_raw[j])
-
         melody_raw = filtered
-        logger.info(f"[{job_id}] После гистерезиса: {len(melody_raw)} фреймов")
 
-        # Группировка в ноты
+        set_stage(job_id, "smooth")
         notes = []
         if melody_raw:
             current = {"start": melody_raw[0]["time"], "pitch": melody_raw[0]["midi"], "amp": melody_raw[0]["amp"]}
@@ -307,7 +315,6 @@ def process_audio(job_id: str, input_path: Path):
                             "velocity": min(127, int(current["amp"] * 127))
                         })
                     current = {"start": m["time"], "pitch": m["midi"], "amp": m["amp"]}
-
             dur = duration - current["start"]
             if dur >= NOTE_THRESHOLD:
                 notes.append({
@@ -317,26 +324,22 @@ def process_audio(job_id: str, input_path: Path):
                     "velocity": min(127, int(current["amp"] * 127))
                 })
 
-        logger.info(f"[{job_id}] Нот: {len(notes)}")
-
         if not notes:
             raise ValueError("Мелодия не выделена")
 
-        # Диапазон C4–C6
         for n in notes:
             while n["pitch"] < 60:
                 n["pitch"] += 12
             while n["pitch"] > 84:
                 n["pitch"] -= 12
 
-        # Убираем дубли подряд
         deduped = [notes[0]]
         for n in notes[1:]:
             if n["pitch"] != deduped[-1]["pitch"]:
                 deduped.append(n)
         notes = deduped
 
-        # Квантизация
+        set_stage(job_id, "quantize")
         spq = 60.0 / 120
         quantized = []
         for n in notes:
@@ -350,6 +353,7 @@ def process_audio(job_id: str, input_path: Path):
                 "velocity": n["velocity"]
             })
 
+        set_stage(job_id, "done")
         jobs[job_id]["melody"] = quantized
         jobs[job_id]["fft"] = frames[::max(1, len(frames) // 300)]
         jobs[job_id]["duration"] = round(duration, 1)
