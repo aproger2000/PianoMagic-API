@@ -15,7 +15,7 @@ import numpy as np
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="PianoMagic API", version="4.1.1")
+app = FastAPI(title="PianoMagic API", version="4.2.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -47,22 +47,19 @@ DIVISIONS = 2
 NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
 STAGES = {
-    "upload":    {"text": "Загрузка файла...",          "progress": 10},
-    "read":      {"text": "Чтение аудио (ffmpeg)...",   "progress": 20},
-    "fft":       {"text": "FFT-анализ (50мс фреймы)...","progress": 40},
-    "harmonic":  {"text": "Подавление гармоник...",     "progress": 55},
-    "smooth":    {"text": "Сглаживание мелодии...",     "progress": 70},
-    "quantize":  {"text": "Квантизация нот...",         "progress": 85},
-    "done":      {"text": "Готово!",                    "progress": 100},
+    "upload": {"text": "Загрузка файла...", "progress": 10},
+    "read": {"text": "Чтение аудио (ffmpeg)...", "progress": 20},
+    "fft": {"text": "FFT-анализ (50мс фреймы)...", "progress": 40},
+    "harmonic": {"text": "Подавление гармоник...", "progress": 55},
+    "smooth": {"text": "Сглаживание мелодии...", "progress": 70},
+    "quantize": {"text": "Квантизация нот...", "progress": 85},
+    "done": {"text": "Готово!", "progress": 100},
 }
 
-avg_pitch = sum(n["pitch"] for n in notes) / len(notes)
-clef_sign = "F" if avg_pitch < 55 else "G"
-clef_line = "4" if avg_pitch < 55 else "2"
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "version": "4.1.1"}
+    return {"status": "ok", "version": "4.2.0"}
 
 
 @app.post("/analyze")
@@ -131,22 +128,17 @@ async def render_pdf(job_id: str):
     xml_path = Path(jobs[job_id]["xml_path"])
     pdf_path = Path(jobs[job_id]["pdf_path"])
 
-    mscore = find_musescore()
-    if not mscore:
-        raise RuntimeError("MuseScore не найден")
-    result = subprocess.run(
-        [mscore, "-o", str(pdf_path), str(xml_path)],
-        capture_output=True, text=True, timeout=120
-    )
-
     try:
         build_musicxml(jobs[job_id]["melody"], xml_path)
+        mscore = find_musescore()
+        if not mscore:
+            raise RuntimeError("MuseScore не найден")
         result = subprocess.run(
-            ["musescore3", "-o", str(pdf_path), str(xml_path)],
+            [mscore, "-o", str(pdf_path), str(xml_path)],
             capture_output=True, text=True, timeout=120
         )
         if result.returncode != 0:
-            raise RuntimeError(f"MuseScore3 error: {result.stderr or result.stdout}")
+            raise RuntimeError(f"MuseScore error: {result.stderr or result.stdout}")
         jobs[job_id]["status"] = "completed"
         return {"status": "completed", "job_id": job_id}
     except Exception as e:
@@ -170,11 +162,6 @@ def set_stage(job_id, stage):
         jobs[job_id]["stage"] = stage
         logger.info(f"[{job_id}] Stage: {stage}")
 
-def find_musescore():
-    for cmd in ["musescore3", "musescore", "mscore"]:
-        if shutil.which(cmd):
-            return cmd
-    return None
 
 def read_audio(path):
     cmd = ['ffmpeg', '-y', '-i', str(path), '-ar', str(SR), '-ac', '1', '-f', 'f32le', '-']
@@ -207,6 +194,13 @@ def dur_info(dur):
     return 'eighth', False
 
 
+def find_musescore():
+    for cmd in ["musescore3", "musescore", "mscore"]:
+        if shutil.which(cmd):
+            return cmd
+    return None
+
+
 def find_fundamental(spectrum, freqs, min_f, max_f):
     mask = (freqs >= min_f) & (freqs <= max_f)
     mel_freqs = freqs[mask]
@@ -233,7 +227,7 @@ def find_fundamental(spectrum, freqs, min_f, max_f):
         is_harmonic = False
         for div in [2, 3, 4]:
             fundamental = freq / div
-            if fundamental < 30:          # ← разрешаем искать фундаментал даже очень низко
+            if fundamental < 30:
                 continue
             f_idx = np.argmin(np.abs(mel_freqs - fundamental))
             if f_idx < len(mel_spec) and mel_spec[f_idx] > amp * 0.15:
@@ -314,7 +308,7 @@ def process_audio(job_id: str, input_path: Path):
             if run_len >= min_frames:
                 for j in range(run_start, len(melody_raw)):
                     filtered.append(melody_raw[j])
-        melody_raw = filtered
+            melody_raw = filtered
 
         set_stage(job_id, "smooth")
         notes = []
@@ -342,8 +336,8 @@ def process_audio(job_id: str, input_path: Path):
 
         if not notes:
             raise ValueError("Мелодия не выделена")
-            
-# Опционально: ограничить диапазон пианино A0–C8, но не сдвигать октавы
+
+        # Ограничить диапазон пианино A0-C8, не сдвигая октавы
         for n in notes:
             n["pitch"] = max(21, min(108, n["pitch"]))
 
@@ -354,11 +348,10 @@ def process_audio(job_id: str, input_path: Path):
         notes = deduped
 
         set_stage(job_id, "quantize")
-         spq = 60.0 / bpm  # bpm можно передавать с фронта, по умолчанию 120
-
+        bpm = 120
+        spq = 60.0 / bpm
         quantized = []
         for n in notes:
-               # шаг 0.25 вместо 0.5 для более точной ритмики
             qs = round((n["start"] / spq) / 0.25) * 0.25
             qdur = max(0.25, round((n["dur"] / spq) / 0.25) * 0.25)
             qdur = min(4.0, qdur)
@@ -386,15 +379,14 @@ def process_audio(job_id: str, input_path: Path):
 
 
 def build_musicxml(notes, xml_path):
+    avg_pitch = sum(n["pitch"] for n in notes) / len(notes)
+    clef_sign = "F" if avg_pitch < 55 else "G"
+    clef_line = "4" if avg_pitch < 55 else "2"
+
     root = Element('score-partwise', {'version': '3.1'})
     plist = SubElement(root, 'part-list')
     sp = SubElement(plist, 'score-part', {'id': 'P1'})
     SubElement(sp, 'part-name').text = 'Melody'
-
-    # в build_musicxml:
-    c = SubElement(attr, 'clef')
-    SubElement(c, 'sign').text = clef_sign
-    SubElement(c, 'line').text = clef_line
 
     part = SubElement(root, 'part', {'id': 'P1'})
     measures = {}
@@ -422,8 +414,8 @@ def build_musicxml(notes, xml_path):
             SubElement(t, 'beats').text = '4'
             SubElement(t, 'beat-type').text = '4'
             c = SubElement(attr, 'clef')
-            SubElement(c, 'sign').text = 'G'
-            SubElement(c, 'line').text = '2'
+            SubElement(c, 'sign').text = clef_sign
+            SubElement(c, 'line').text = clef_line
 
         events = sorted(measures[m_idx], key=lambda x: x['offset'])
         last_end = 0
@@ -469,6 +461,6 @@ def build_musicxml(notes, xml_path):
                 SubElement(r, 'dot')
 
     xml_str = tostring(root, encoding='unicode')
-    doctype = '<!DOCTYPE score-partwise PUBLIC "-//Recordare//DTD MusicXML 3.1 Partwise//EN" "http://www.musicxml.org/dtds/partwise.dtd">\n'
+    doctype = '<?xml version="1.0" encoding="UTF-8"?>'
     with open(xml_path, 'w', encoding='utf-8') as f:
-        f.write('<?xml version="1.0" encoding="UTF-8"?>\n' + doctype + xml_str)
+        f.write(doctype + chr(10) + xml_str)
