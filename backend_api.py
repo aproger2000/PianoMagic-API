@@ -40,7 +40,7 @@ HOP = int(SR * HOP_MS / 1000)
 N_FFT = 4096
 MIN_AMP = 0.05
 NOTE_THRESHOLD = 0.15
-MELODY_MIN_FREQ = 200
+MELODY_MIN_FREQ = 50
 MELODY_MAX_FREQ = 1500
 DIVISIONS = 2
 
@@ -56,6 +56,9 @@ STAGES = {
     "done":      {"text": "Готово!",                    "progress": 100},
 }
 
+avg_pitch = sum(n["pitch"] for n in notes) / len(notes)
+clef_sign = "F" if avg_pitch < 55 else "G"
+clef_line = "4" if avg_pitch < 55 else "2"
 
 @app.get("/")
 async def root():
@@ -128,6 +131,14 @@ async def render_pdf(job_id: str):
     xml_path = Path(jobs[job_id]["xml_path"])
     pdf_path = Path(jobs[job_id]["pdf_path"])
 
+    mscore = find_musescore()
+    if not mscore:
+        raise RuntimeError("MuseScore не найден")
+    result = subprocess.run(
+        [mscore, "-o", str(pdf_path), str(xml_path)],
+        capture_output=True, text=True, timeout=120
+    )
+
     try:
         build_musicxml(jobs[job_id]["melody"], xml_path)
         result = subprocess.run(
@@ -159,6 +170,11 @@ def set_stage(job_id, stage):
         jobs[job_id]["stage"] = stage
         logger.info(f"[{job_id}] Stage: {stage}")
 
+def find_musescore():
+    for cmd in ["musescore3", "musescore", "mscore"]:
+        if shutil.which(cmd):
+            return cmd
+    return None
 
 def read_audio(path):
     cmd = ['ffmpeg', '-y', '-i', str(path), '-ar', str(SR), '-ac', '1', '-f', 'f32le', '-']
@@ -217,7 +233,7 @@ def find_fundamental(spectrum, freqs, min_f, max_f):
         is_harmonic = False
         for div in [2, 3, 4]:
             fundamental = freq / div
-            if fundamental < min_f:
+            if fundamental < 30:          # ← разрешаем искать фундаментал даже очень низко
                 continue
             f_idx = np.argmin(np.abs(mel_freqs - fundamental))
             if f_idx < len(mel_spec) and mel_spec[f_idx] > amp * 0.15:
@@ -326,12 +342,10 @@ def process_audio(job_id: str, input_path: Path):
 
         if not notes:
             raise ValueError("Мелодия не выделена")
-
+            
+# Опционально: ограничить диапазон пианино A0–C8, но не сдвигать октавы
         for n in notes:
-            while n["pitch"] < 60:
-                n["pitch"] += 12
-            while n["pitch"] > 84:
-                n["pitch"] -= 12
+            n["pitch"] = max(21, min(108, n["pitch"]))
 
         deduped = [notes[0]]
         for n in notes[1:]:
@@ -340,11 +354,13 @@ def process_audio(job_id: str, input_path: Path):
         notes = deduped
 
         set_stage(job_id, "quantize")
-        spq = 60.0 / 120
+         spq = 60.0 / bpm  # bpm можно передавать с фронта, по умолчанию 120
+
         quantized = []
         for n in notes:
-            qs = round((n["start"] / spq) / 0.5) * 0.5
-            qdur = max(0.5, round((n["dur"] / spq) / 0.5) * 0.5)
+               # шаг 0.25 вместо 0.5 для более точной ритмики
+            qs = round((n["start"] / spq) / 0.25) * 0.25
+            qdur = max(0.25, round((n["dur"] / spq) / 0.25) * 0.25)
             qdur = min(4.0, qdur)
             quantized.append({
                 "start": qs,
@@ -374,6 +390,11 @@ def build_musicxml(notes, xml_path):
     plist = SubElement(root, 'part-list')
     sp = SubElement(plist, 'score-part', {'id': 'P1'})
     SubElement(sp, 'part-name').text = 'Melody'
+
+    # в build_musicxml:
+    c = SubElement(attr, 'clef')
+    SubElement(c, 'sign').text = clef_sign
+    SubElement(c, 'line').text = clef_line
 
     part = SubElement(root, 'part', {'id': 'P1'})
     measures = {}
