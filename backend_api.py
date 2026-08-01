@@ -15,6 +15,14 @@ import numpy as np
 from scipy import signal
 from scipy.ndimage import median_filter
 
+# Try to import librosa; fallback to custom FFT if unavailable
+try:
+    import librosa
+    HAS_LIBROSA = True
+except ImportError:
+    HAS_LIBROSA = False
+    logging.warning("librosa not available, falling back to custom FFT")
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -42,9 +50,9 @@ HOP_MS = 50
 HOP = int(SR * HOP_MS / 1000)
 N_FFT = 4096
 MIN_AMP = 0.03
-NOTE_THRESHOLD = 0.08
+NOTE_THRESHOLD = 0.15
 MELODY_MIN_FREQ = 200
-MELODY_MAX_FREQ = 1200
+MELODY_MAX_FREQ = 1500
 HPF_CUTOFF = 250
 DIVISIONS = 8
 
@@ -194,12 +202,6 @@ def read_audio(path):
     return np.frombuffer(result.stdout, dtype=np.float32)
 
 
-def apply_hpf(audio, cutoff, sr):
-    nyq = sr / 2.0
-    b, a = signal.butter(4, cutoff / nyq, btype='high', analog=False)
-    return signal.filtfilt(b, a, audio)
-
-
 def compute_spectrogram(audio, sr, n_fft=2048, hop=512):
     frames = []
     window = np.hanning(n_fft)
@@ -210,46 +212,204 @@ def compute_spectrogram(audio, sr, n_fft=2048, hop=512):
     if not frames:
         return np.zeros((n_fft // 2 + 1, 1))
     spec = np.array(frames).T
-
     spec_db = 20 * np.log10(spec + 1e-10)
     vmax = spec_db.max()
     spec_db = np.clip(spec_db, vmax - 60, vmax)
     spec_db = (spec_db - spec_db.min()) / (spec_db.max() - spec_db.min() + 1e-10)
-
     freq_step = max(1, spec_db.shape[0] // 128)
     time_step = max(1, spec_db.shape[1] // 200)
     spec_db = spec_db[::freq_step, ::time_step]
     return (spec_db * 255).astype(np.uint8)
 
 
-def find_melody_pitch(spectrum, freqs, min_f, max_f):
-    """Salience-based pitch detection: prefers fundamentals with harmonics"""
-    mask = (freqs >= min_f) & (freqs <= max_f)
-    mel_freqs = freqs[mask]
-    mel_spec = spectrum[mask]
+def extract_melody_pyin(audio, sr):
+    """Use librosa.pyin for robust pitch tracking, with HPSS pre-processing."""
+    try:
+        # HPSS: separate harmonic content
+        y_harmonic, y_percussive = librosa.effects.hpss(audio)
+        
+        # pYIN on harmonic part
+        f0, voiced_flag, voiced_probs = librosa.pyin(
+            y_harmonic,
+            fmin=librosa.note_to_hz('C3'),
+            fmax=librosa.note_to_hz('C6'),
+            sr=sr,
+            frame_length=2048,
+            hop_length=int(sr * HOP_MS / 1000)
+        )
+        
+        times = librosa.times_like(f0, sr=sr, hop_length=int(sr * HOP_MS / 1000))
+        
+        frames = []
+        for t, freq, flag in zip(times, f0, voiced_flag):
+            if flag and not np.isnan(freq) and freq > 0:
+                midi = int(round(librosa.hz_to_midi(freq)))
+                # Clamp to reasonable range
+                if 48 <= midi <= 96:  # C3-C7
+                    frames.append({
+                        "time": round(float(t), 3),
+                        "freq": round(float(freq), 1),
+                        "midi": midi,
+                        "amp": 0.5  # pyin doesn't give amplitude
+                    })
+        return frames
+    except Exception as e:
+        logger.error(f"pyin failed: {e}")
+        return None
 
-    if len(mel_spec) == 0:
-        return None, 0
 
-    # Compute salience: fundamental + weighted harmonics
-    salience = np.zeros_like(mel_spec)
-    for i, f in enumerate(mel_freqs):
-        s = mel_spec[i]
-        for h in [2, 3, 4]:
-            hf = f * h
-            if hf > freqs[-1]:
-                break
-            h_idx = np.argmin(np.abs(freqs - hf))
-            if h_idx < len(spectrum):
-                s += spectrum[h_idx] * (0.5 ** (h - 1))
-        salience[i] = s
+def extract_melody_fft(audio, sr):
+    """Fallback custom FFT-based extraction."""
+    nyq = sr / 2.0
+    b, a = signal.butter(4, HPF_CUTOFF / nyq, btype='high', analog=False)
+    y_hp = signal.filtfilt(b, a, audio)
 
-    idx = np.argmax(salience)
-    freq = mel_freqs[idx]
-    amp = mel_spec[idx]
-    global_max = np.max(spectrum) + 1e-10
-    amp_norm = min(1.0, amp / global_max)
-    return freq, amp_norm
+    freqs = np.fft.rfftfreq(N_FFT, 1 / sr)
+    frames = []
+
+    for i in range(0, len(y_hp) - N_FFT, HOP):
+        frame = y_hp[i:i + N_FFT] * np.hanning(N_FFT)
+        spectrum = np.abs(np.fft.rfft(frame))
+
+        mask = (freqs >= MELODY_MIN_FREQ) & (freqs <= MELODY_MAX_FREQ)
+        mel_freqs = freqs[mask]
+        mel_spec = spectrum[mask]
+
+        if len(mel_spec) == 0:
+            continue
+
+        # Salience
+        salience = np.zeros_like(mel_spec)
+        for idx, f in enumerate(mel_freqs):
+            s = mel_spec[idx]
+            for h in [2, 3, 4]:
+                hf = f * h
+                if hf > freqs[-1]:
+                    break
+                h_idx = np.argmin(np.abs(freqs - hf))
+                if h_idx < len(spectrum):
+                    s += spectrum[h_idx] * (0.4 ** (h - 1))
+            salience[idx] = s
+
+        idx = np.argmax(salience)
+        peak_freq = mel_freqs[idx]
+        peak_amp = mel_spec[idx]
+
+        global_max = np.max(spectrum) + 1e-10
+        amp_norm = min(1.0, peak_amp / global_max)
+        time = i / sr
+        midi = int(round(69 + 12 * np.log2(peak_freq / 440.0)))
+
+        frames.append({
+            "time": round(time, 3),
+            "freq": round(peak_freq, 1),
+            "midi": midi,
+            "amp": amp_norm
+        })
+
+    return frames
+
+
+def post_process_melody(frames, duration):
+    """Clean up melody: median filter, hysteresis, outlier removal, segmentation."""
+    if not frames:
+        return []
+
+    # Median filter: 11 frames (~550ms)
+    if len(frames) > 11:
+        pitches = [f["midi"] for f in frames]
+        smoothed = median_filter(pitches, size=11)
+        for i, f in enumerate(frames):
+            f["midi"] = int(smoothed[i])
+
+    # Hysteresis: min 5 frames (~250ms)
+    min_frames = 5
+    filtered = []
+    run_start = 0
+    run_pitch = frames[0]["midi"]
+    for i in range(1, len(frames)):
+        if frames[i]["midi"] != run_pitch:
+            run_len = i - run_start
+            if run_len >= min_frames:
+                for j in range(run_start, i):
+                    filtered.append(frames[j])
+            run_start = i
+            run_pitch = frames[i]["midi"]
+    run_len = len(frames) - run_start
+    if run_len >= min_frames:
+        for j in range(run_start, len(frames)):
+            filtered.append(frames[j])
+    frames = filtered
+
+    # Segment into notes
+    notes = []
+    if frames:
+        current = {"start": frames[0]["time"], "pitch": frames[0]["midi"], "amp": frames[0].get("amp", 0.5)}
+        for f in frames[1:]:
+            if f["midi"] != current["pitch"]:
+                dur = f["time"] - current["start"]
+                if dur >= NOTE_THRESHOLD:
+                    notes.append({
+                        "start": round(current["start"], 2),
+                        "dur": round(dur, 2),
+                        "pitch": current["pitch"],
+                        "velocity": min(127, int(current.get("amp", 0.5) * 127))
+                    })
+                current = {"start": f["time"], "pitch": f["midi"], "amp": f.get("amp", 0.5)}
+        dur = duration - current["start"]
+        if dur >= NOTE_THRESHOLD:
+            notes.append({
+                "start": round(current["start"], 2),
+                "dur": round(dur, 2),
+                "pitch": current["pitch"],
+                "velocity": min(127, int(current.get("amp", 0.5) * 127))
+            })
+
+    if not notes:
+        return []
+
+    # Clamp to piano range
+    for n in notes:
+        n["pitch"] = max(21, min(108, n["pitch"]))
+
+    # Deduplicate adjacent same pitches
+    deduped = [notes[0]]
+    for n in notes[1:]:
+        if n["pitch"] != deduped[-1]["pitch"]:
+            deduped.append(n)
+
+    # Remove outlier short notes surrounded by long same notes
+    cleaned = []
+    for i, n in enumerate(deduped):
+        if i == 0 or i == len(deduped) - 1:
+            cleaned.append(n)
+            continue
+        prev_dur = deduped[i-1]["dur"]
+        next_dur = deduped[i+1]["dur"]
+        curr_dur = n["dur"]
+        # If this note is very short and neighbors are long and same pitch, skip
+        if curr_dur < 0.2 and prev_dur > 0.5 and next_dur > 0.5 and abs(deduped[i-1]["pitch"] - deduped[i+1]["pitch"]) <= 1:
+            continue
+        cleaned.append(n)
+
+    return cleaned
+
+
+def quantize_notes(notes, bpm=120):
+    spq = 60.0 / bpm
+    grid = 0.125  # 1/8th note
+    quantized = []
+    for n in notes:
+        qs = round((n["start"] / spq) / grid) * grid
+        qdur = max(grid, round((n["dur"] / spq) / grid) * grid)
+        qdur = min(4.0, qdur)
+        quantized.append({
+            "start": qs,
+            "dur": qdur,
+            "pitch": n["pitch"],
+            "velocity": n["velocity"]
+        })
+    return quantized
 
 
 def freq_to_midi(freq):
@@ -267,7 +427,6 @@ def midi_to_name(midi):
 
 
 def dur_info(dur):
-    """For divisions=8: 32=whole, 24=dotted-half, 16=half, 12=dotted-quarter, 8=quarter, 6=dotted-eighth, 4=eighth, 2=16th"""
     if dur >= 28: return 'whole', False
     if dur >= 20: return 'half', True
     if dur >= 12: return 'half', False
@@ -347,122 +506,31 @@ def process_audio(job_id: str, input_path: Path):
         if len(audio) < N_FFT:
             raise ValueError("Аудио слишком короткое")
 
-        # 1. Spectrogram for visualization (from original)
+        # Spectrogram for visualization
         set_stage(job_id, "fft")
         spec_uint8 = compute_spectrogram(audio, SR)
         spec_list = spec_uint8.tolist()
 
-        # 2. Apply HPF to reduce bass accompaniment
-        audio_hp = apply_hpf(audio, HPF_CUTOFF, SR)
-
-        # 3. FFT analysis with salience-based pitch detection
-        freqs = np.fft.rfftfreq(N_FFT, 1 / SR)
-        frames = []
-
-        for i in range(0, len(audio_hp) - N_FFT, HOP):
-            frame = audio_hp[i:i + N_FFT] * np.hanning(N_FFT)
-            spectrum = np.abs(np.fft.rfft(frame))
-
-            peak_freq, peak_amp = find_melody_pitch(spectrum, freqs, MELODY_MIN_FREQ, MELODY_MAX_FREQ)
-            if peak_freq is None:
-                continue
-
-            time = i / SR
-            midi = int(round(freq_to_midi(peak_freq)))
-            frames.append({
-                "time": round(time, 3),
-                "freq": round(peak_freq, 1),
-                "amp": round(peak_amp, 3),
-                "midi": midi
-            })
+        # Melody extraction
+        set_stage(job_id, "harmonic")
+        if HAS_LIBROSA:
+            logger.info(f"[{job_id}] Using librosa.pyin + HPSS")
+            frames = extract_melody_pyin(audio, SR)
+        else:
+            logger.info(f"[{job_id}] Using fallback FFT")
+            frames = extract_melody_fft(audio, SR)
 
         if not frames:
             raise ValueError("Не удалось извлечь мелодию")
 
-        set_stage(job_id, "harmonic")
-        melody_raw = [f for f in frames if f["amp"] >= MIN_AMP]
-
-        # Median filter: 5 frames (~250ms) — enough to denoise, preserves rhythm
-        if len(melody_raw) > 5:
-            pitches = [m["midi"] for m in melody_raw]
-            smoothed = median_filter(pitches, size=5)
-            for i, m in enumerate(melody_raw):
-                m["midi"] = int(smoothed[i])
-
-        # Hysteresis: min 3 frames (~150ms)
-        min_frames = 3
-        filtered = []
-        if melody_raw:
-            run_start = 0
-            run_pitch = melody_raw[0]["midi"]
-            for i in range(1, len(melody_raw)):
-                if melody_raw[i]["midi"] != run_pitch:
-                    run_len = i - run_start
-                    if run_len >= min_frames:
-                        for j in range(run_start, i):
-                            filtered.append(melody_raw[j])
-                    run_start = i
-                    run_pitch = melody_raw[i]["midi"]
-            run_len = len(melody_raw) - run_start
-            if run_len >= min_frames:
-                for j in range(run_start, len(melody_raw)):
-                    filtered.append(melody_raw[j])
-            melody_raw = filtered
-
         set_stage(job_id, "smooth")
-        notes = []
-        if melody_raw:
-            current = {"start": melody_raw[0]["time"], "pitch": melody_raw[0]["midi"], "amp": melody_raw[0]["amp"]}
-            for m in melody_raw[1:]:
-                if m["midi"] != current["pitch"]:
-                    dur = m["time"] - current["start"]
-                    if dur >= NOTE_THRESHOLD:
-                        notes.append({
-                            "start": round(current["start"], 2),
-                            "dur": round(dur, 2),
-                            "pitch": current["pitch"],
-                            "velocity": min(127, int(current["amp"] * 127))
-                        })
-                    current = {"start": m["time"], "pitch": m["midi"], "amp": m["amp"]}
-            dur = duration - current["start"]
-            if dur >= NOTE_THRESHOLD:
-                notes.append({
-                    "start": round(current["start"], 2),
-                    "dur": round(dur, 2),
-                    "pitch": current["pitch"],
-                    "velocity": min(127, int(current["amp"] * 127))
-                })
+        notes = post_process_melody(frames, duration)
 
         if not notes:
             raise ValueError("Мелодия не выделена")
 
-        # Clamp to piano range
-        for n in notes:
-            n["pitch"] = max(21, min(108, n["pitch"]))
-
-        # Deduplicate adjacent same pitches
-        deduped = [notes[0]]
-        for n in notes[1:]:
-            if n["pitch"] != deduped[-1]["pitch"]:
-                deduped.append(n)
-        notes = deduped
-
         set_stage(job_id, "quantize")
-        bpm = 120
-        spq = 60.0 / bpm
-        # Quantize to 1/8th note grid (0.125 beats)
-        grid = 0.125
-        quantized = []
-        for n in notes:
-            qs = round((n["start"] / spq) / grid) * grid
-            qdur = max(grid, round((n["dur"] / spq) / grid) * grid)
-            qdur = min(4.0, qdur)
-            quantized.append({
-                "start": qs,
-                "dur": qdur,
-                "pitch": n["pitch"],
-                "velocity": n["velocity"]
-            })
+        quantized = quantize_notes(notes, bpm=120)
 
         set_stage(job_id, "render")
         wav_path = Path(jobs[job_id]["wav_path"])
