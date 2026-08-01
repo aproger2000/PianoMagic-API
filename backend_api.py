@@ -15,7 +15,7 @@ import numpy as np
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="PianoMagic API", version="4.0.0")
+app = FastAPI(title="PianoMagic API", version="4.1.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -37,11 +37,11 @@ jobs = {}
 SR = 22050
 HOP_MS = 50
 HOP = int(SR * HOP_MS / 1000)
-N_FFT = 2048
-MIN_AMP = 0.02
-NOTE_THRESHOLD = 0.08
-MELODY_MIN_FREQ = 250
-MELODY_MAX_FREQ = 1050
+N_FFT = 4096
+MIN_AMP = 0.05
+NOTE_THRESHOLD = 0.15
+MELODY_MIN_FREQ = 200
+MELODY_MAX_FREQ = 1500
 DIVISIONS = 2
 
 NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
@@ -49,7 +49,7 @@ NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "version": "4.0.0"}
+    return {"status": "ok", "version": "4.1.0"}
 
 
 @app.post("/analyze")
@@ -165,9 +165,62 @@ def dur_info(dur):
     return 'eighth', False
 
 
+def find_fundamental(spectrum, freqs, min_f, max_f):
+    """Находит fundamental frequency с подавлением гармоник."""
+    mask = (freqs >= min_f) & (freqs <= max_f)
+    mel_freqs = freqs[mask]
+    mel_spec = spectrum[mask]
+
+    if len(mel_spec) == 0:
+        return None, 0
+
+    # Находим топ-5 пиков
+    peak_indices = []
+    spec_copy = mel_spec.copy()
+    for _ in range(5):
+        if len(spec_copy) == 0:
+            break
+        idx = np.argmax(spec_copy)
+        peak_indices.append(idx)
+        # Обнуляем окрестности
+        left = max(0, idx - 3)
+        right = min(len(spec_copy), idx + 4)
+        spec_copy[left:right] = 0
+
+    candidates = []
+    for idx in peak_indices:
+        freq = mel_freqs[idx]
+        amp = mel_spec[idx]
+
+        # Проверяем, не является ли гармоникой
+        is_harmonic = False
+        for div in [2, 3, 4]:
+            fundamental = freq / div
+            if fundamental < min_f:
+                continue
+            # Ищем ближайший бин
+            f_idx = np.argmin(np.abs(mel_freqs - fundamental))
+            if f_idx < len(mel_spec) and mel_spec[f_idx] > amp * 0.15:
+                # Есть энергия на fundamental — значит текущий пик гармоника
+                is_harmonic = True
+                # Заменяем на fundamental
+                candidates.append((mel_freqs[f_idx], mel_spec[f_idx]))
+                break
+
+        if not is_harmonic:
+            candidates.append((freq, amp))
+
+    if not candidates:
+        return None, 0
+
+    # Берём кандидата с максимальной амплитудой
+    best = max(candidates, key=lambda x: x[1])
+    return best[0], best[1]
+
+
 def process_audio(job_id: str, input_path: Path):
     try:
-        logger.info(f"[{job_id}] === FFT анализ v4.0.0 ===")
+        logger.info(f"[{job_id}] === FFT v4.1.0 (harmonic suppression) ===")
         audio = read_audio(input_path)
         duration = len(audio) / SR
         logger.info(f"[{job_id}] Аудио: {duration:.1f}s")
@@ -176,21 +229,16 @@ def process_audio(job_id: str, input_path: Path):
             raise ValueError("Аудио слишком короткое")
 
         freqs = np.fft.rfftfreq(N_FFT, 1 / SR)
-        mask = (freqs >= MELODY_MIN_FREQ) & (freqs <= MELODY_MAX_FREQ)
-        mel_freqs = freqs[mask]
 
         frames = []
         for i in range(0, len(audio) - N_FFT, HOP):
             frame = audio[i:i + N_FFT] * np.hanning(N_FFT)
             spectrum = np.abs(np.fft.rfft(frame))
-            mel_spectrum = spectrum[mask]
 
-            if len(mel_spectrum) == 0:
+            peak_freq, peak_amp = find_fundamental(spectrum, freqs, MELODY_MIN_FREQ, MELODY_MAX_FREQ)
+            if peak_freq is None:
                 continue
 
-            peak_idx = np.argmax(mel_spectrum)
-            peak_freq = float(mel_freqs[peak_idx])
-            peak_amp = float(mel_spectrum[peak_idx])
             global_max = np.max(spectrum) + 1e-10
             amp_norm = min(1.0, peak_amp / global_max)
 
@@ -210,24 +258,46 @@ def process_audio(job_id: str, input_path: Path):
         # Фильтр по амплитуде
         melody_raw = [f for f in frames if f["amp"] >= MIN_AMP]
 
-        # Медианный фильтр (окно 5)
-        if len(melody_raw) > 5:
+        # Медианный фильтр (окно 7)
+        if len(melody_raw) > 7:
             pitches = [m["midi"] for m in melody_raw]
             smoothed = []
             for i in range(len(pitches)):
-                window = pitches[max(0, i - 2):min(len(pitches), i + 3)]
+                window = pitches[max(0, i - 3):min(len(pitches), i + 4)]
                 smoothed.append(int(np.median(window)))
             for i, m in enumerate(melody_raw):
                 m["midi"] = smoothed[i]
+
+        # === ГИСТЕРЕЗИС: убираем кратковременные скачки (< 150мс) ===
+        HYSTERESIS_MS = 0.15
+        min_frames = int(HYSTERESIS_MS / (HOP_MS / 1000))
+        filtered = []
+        if melody_raw:
+            run_start = 0
+            run_pitch = melody_raw[0]["midi"]
+            for i in range(1, len(melody_raw)):
+                if melody_raw[i]["midi"] != run_pitch:
+                    run_len = i - run_start
+                    if run_len >= min_frames:
+                        for j in range(run_start, i):
+                            filtered.append(melody_raw[j])
+                    run_start = i
+                    run_pitch = melody_raw[i]["midi"]
+            # последний run
+            run_len = len(melody_raw) - run_start
+            if run_len >= min_frames:
+                for j in range(run_start, len(melody_raw)):
+                    filtered.append(melody_raw[j])
+
+        melody_raw = filtered
+        logger.info(f"[{job_id}] После гистерезиса: {len(melody_raw)} фреймов")
 
         # Группировка в ноты
         notes = []
         if melody_raw:
             current = {"start": melody_raw[0]["time"], "pitch": melody_raw[0]["midi"], "amp": melody_raw[0]["amp"]}
             for m in melody_raw[1:]:
-                if m["midi"] == current["pitch"]:
-                    current["amp"] = max(current["amp"], m["amp"])
-                else:
+                if m["midi"] != current["pitch"]:
                     dur = m["time"] - current["start"]
                     if dur >= NOTE_THRESHOLD:
                         notes.append({
@@ -259,6 +329,13 @@ def process_audio(job_id: str, input_path: Path):
             while n["pitch"] > 84:
                 n["pitch"] -= 12
 
+        # Убираем дубли подряд
+        deduped = [notes[0]]
+        for n in notes[1:]:
+            if n["pitch"] != deduped[-1]["pitch"]:
+                deduped.append(n)
+        notes = deduped
+
         # Квантизация
         spq = 60.0 / 120
         quantized = []
@@ -274,7 +351,7 @@ def process_audio(job_id: str, input_path: Path):
             })
 
         jobs[job_id]["melody"] = quantized
-        jobs[job_id]["fft"] = frames[::max(1, len(frames) // 200)]
+        jobs[job_id]["fft"] = frames[::max(1, len(frames) // 300)]
         jobs[job_id]["duration"] = round(duration, 1)
         jobs[job_id]["status"] = "analyzed"
         logger.info(f"[{job_id}] Готово")
