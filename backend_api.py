@@ -15,18 +15,10 @@ import numpy as np
 from scipy import signal
 from scipy.ndimage import median_filter
 
-# Try to import librosa; fallback to custom FFT if unavailable
-try:
-    import librosa
-    HAS_LIBROSA = True
-except ImportError:
-    HAS_LIBROSA = False
-    logging.warning("librosa not available, falling back to custom FFT")
-
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="PianoMagic API", version="4.2.3")
+app = FastAPI(title="PianoMagic API", version="4.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -49,11 +41,6 @@ SR = 22050
 HOP_MS = 50
 HOP = int(SR * HOP_MS / 1000)
 N_FFT = 4096
-MIN_AMP = 0.03
-NOTE_THRESHOLD = 0.15
-MELODY_MIN_FREQ = 200
-MELODY_MAX_FREQ = 1500
-HPF_CUTOFF = 250
 DIVISIONS = 8
 
 NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
@@ -61,9 +48,9 @@ NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 STAGES = {
     "upload": {"text": "Загрузка файла...", "progress": 10},
     "read": {"text": "Чтение аудио (ffmpeg)...", "progress": 20},
-    "fft": {"text": "FFT-анализ (50мс фреймы)...", "progress": 40},
-    "harmonic": {"text": "Подавление гармоник...", "progress": 55},
-    "smooth": {"text": "Сглаживание мелодии...", "progress": 70},
+    "fft": {"text": "FFT-анализ...", "progress": 40},
+    "voices": {"text": "Разделение голосов...", "progress": 55},
+    "smooth": {"text": "Сглаживание...", "progress": 70},
     "quantize": {"text": "Квантизация нот...", "progress": 85},
     "render": {"text": "Рендер WAV/PDF...", "progress": 95},
     "done": {"text": "Готово!", "progress": 100},
@@ -72,7 +59,7 @@ STAGES = {
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "version": "4.2.3"}
+    return {"status": "ok", "version": "4.3.0"}
 
 
 @app.post("/analyze")
@@ -94,8 +81,8 @@ async def analyze(background_tasks: BackgroundTasks, file: UploadFile = File(...
         "pdf_path": str(job_dir / "output.pdf"),
         "xml_path": str(job_dir / "output.xml"),
         "wav_path": str(job_dir / "output.wav"),
-        "melody": None,
-        "fft": None,
+        "melody_rh": None,
+        "melody_lh": None,
         "spec": None,
         "duration": 0,
         "error": None
@@ -124,11 +111,11 @@ async def get_status(job_id: str):
 async def get_melody(job_id: str):
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    if jobs[job_id]["melody"] is None:
+    if jobs[job_id]["melody_rh"] is None:
         raise HTTPException(status_code=400, detail="Melody not ready")
     return JSONResponse({
-        "melody": jobs[job_id]["melody"],
-        "fft": jobs[job_id]["fft"],
+        "melody_rh": jobs[job_id]["melody_rh"],
+        "melody_lh": jobs[job_id]["melody_lh"],
         "spec": jobs[job_id]["spec"],
         "duration": jobs[job_id]["duration"]
     })
@@ -138,7 +125,7 @@ async def get_melody(job_id: str):
 async def render_pdf(job_id: str):
     if job_id not in jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    if jobs[job_id]["melody"] is None:
+    if jobs[job_id]["melody_rh"] is None:
         raise HTTPException(status_code=400, detail="Melody not ready")
 
     xml_path = Path(jobs[job_id]["xml_path"])
@@ -146,8 +133,8 @@ async def render_pdf(job_id: str):
     wav_path = Path(jobs[job_id]["wav_path"])
 
     try:
-        build_musicxml(jobs[job_id]["melody"], xml_path)
-        generate_wav(jobs[job_id]["melody"], wav_path)
+        build_musicxml(jobs[job_id]["melody_rh"], jobs[job_id]["melody_lh"], xml_path)
+        generate_wav(jobs[job_id]["melody_rh"], jobs[job_id]["melody_lh"], wav_path)
 
         mscore = find_musescore()
         if mscore:
@@ -222,182 +209,105 @@ def compute_spectrogram(audio, sr, n_fft=2048, hop=512):
     return (spec_db * 255).astype(np.uint8)
 
 
-def extract_melody_pyin(audio, sr):
-    """Use librosa.pyin for robust pitch tracking, with HPSS pre-processing."""
-    try:
-        # HPSS: separate harmonic content
-        y_harmonic, y_percussive = librosa.effects.hpss(audio)
-        
-        # pYIN on harmonic part
-        f0, voiced_flag, voiced_probs = librosa.pyin(
-            y_harmonic,
-            fmin=librosa.note_to_hz('C3'),
-            fmax=librosa.note_to_hz('C6'),
-            sr=sr,
-            frame_length=2048,
-            hop_length=int(sr * HOP_MS / 1000)
-        )
-        
-        times = librosa.times_like(f0, sr=sr, hop_length=int(sr * HOP_MS / 1000))
-        
-        frames = []
-        for t, freq, flag in zip(times, f0, voiced_flag):
-            if flag and not np.isnan(freq) and freq > 0:
-                midi = int(round(librosa.hz_to_midi(freq)))
-                # Clamp to reasonable range
-                if 48 <= midi <= 96:  # C3-C7
-                    frames.append({
-                        "time": round(float(t), 3),
-                        "freq": round(float(freq), 1),
-                        "midi": midi,
-                        "amp": 0.5  # pyin doesn't give amplitude
-                    })
-        return frames
-    except Exception as e:
-        logger.error(f"pyin failed: {e}")
-        return None
-
-
-def extract_melody_fft(audio, sr):
-    """Fallback custom FFT-based extraction."""
-    nyq = sr / 2.0
-    b, a = signal.butter(4, HPF_CUTOFF / nyq, btype='high', analog=False)
-    y_hp = signal.filtfilt(b, a, audio)
-
-    freqs = np.fft.rfftfreq(N_FFT, 1 / sr)
+def extract_voice(audio, min_freq, max_freq, median_size=7, hysteresis=3, min_dur=0.15, amp_threshold=0.02):
+    freqs = np.fft.rfftfreq(N_FFT, 1 / SR)
     frames = []
-
-    for i in range(0, len(y_hp) - N_FFT, HOP):
-        frame = y_hp[i:i + N_FFT] * np.hanning(N_FFT)
+    
+    for i in range(0, len(audio) - N_FFT, HOP):
+        frame = audio[i:i + N_FFT] * np.hanning(N_FFT)
         spectrum = np.abs(np.fft.rfft(frame))
-
-        mask = (freqs >= MELODY_MIN_FREQ) & (freqs <= MELODY_MAX_FREQ)
-        mel_freqs = freqs[mask]
-        mel_spec = spectrum[mask]
-
-        if len(mel_spec) == 0:
+        
+        mask = (freqs >= min_freq) & (freqs <= max_freq)
+        band_freqs = freqs[mask]
+        band_spec = spectrum[mask]
+        
+        if len(band_spec) == 0:
             continue
-
-        # Salience
-        salience = np.zeros_like(mel_spec)
-        for idx, f in enumerate(mel_freqs):
-            s = mel_spec[idx]
-            for h in [2, 3, 4]:
-                hf = f * h
-                if hf > freqs[-1]:
-                    break
-                h_idx = np.argmin(np.abs(freqs - hf))
-                if h_idx < len(spectrum):
-                    s += spectrum[h_idx] * (0.4 ** (h - 1))
-            salience[idx] = s
-
-        idx = np.argmax(salience)
-        peak_freq = mel_freqs[idx]
-        peak_amp = mel_spec[idx]
-
+        
+        idx = np.argmax(band_spec)
+        peak_freq = band_freqs[idx]
+        peak_amp = band_spec[idx]
+        
         global_max = np.max(spectrum) + 1e-10
         amp_norm = min(1.0, peak_amp / global_max)
-        time = i / sr
+        if amp_norm < amp_threshold:
+            continue
+        
+        time = i / SR
         midi = int(round(69 + 12 * np.log2(peak_freq / 440.0)))
-
-        frames.append({
-            "time": round(time, 3),
-            "freq": round(peak_freq, 1),
-            "midi": midi,
-            "amp": amp_norm
-        })
-
-    return frames
-
-
-def post_process_melody(frames, duration):
-    """Clean up melody: median filter, hysteresis, outlier removal, segmentation."""
+        frames.append({'time': time, 'freq': peak_freq, 'midi': midi, 'amp': amp_norm})
+    
     if not frames:
         return []
-
-    # Median filter: 11 frames (~550ms)
-    if len(frames) > 11:
-        pitches = [f["midi"] for f in frames]
-        smoothed = median_filter(pitches, size=11)
-        for i, f in enumerate(frames):
-            f["midi"] = int(smoothed[i])
-
-    # Hysteresis: min 5 frames (~250ms)
-    min_frames = 5
+    
+    # Median filter
+    if len(frames) > median_size:
+        pitches = [f['midi'] for f in frames]
+        smoothed = median_filter(pitches, size=median_size)
+        for i in range(len(frames)):
+            frames[i]['midi'] = int(smoothed[i])
+    
+    # Hysteresis
     filtered = []
-    run_start = 0
-    run_pitch = frames[0]["midi"]
-    for i in range(1, len(frames)):
-        if frames[i]["midi"] != run_pitch:
-            run_len = i - run_start
-            if run_len >= min_frames:
-                for j in range(run_start, i):
-                    filtered.append(frames[j])
-            run_start = i
-            run_pitch = frames[i]["midi"]
-    run_len = len(frames) - run_start
-    if run_len >= min_frames:
-        for j in range(run_start, len(frames)):
-            filtered.append(frames[j])
-    frames = filtered
-
-    # Segment into notes
+    if frames:
+        run_start = 0
+        run_pitch = frames[0]['midi']
+        for i in range(1, len(frames)):
+            if frames[i]['midi'] != run_pitch:
+                run_len = i - run_start
+                if run_len >= hysteresis:
+                    for j in range(run_start, i):
+                        filtered.append(frames[j])
+                run_start = i
+                run_pitch = frames[i]['midi']
+        run_len = len(frames) - run_start
+        if run_len >= hysteresis:
+            for j in range(run_start, len(frames)):
+                filtered.append(frames[j])
+        frames = filtered
+    
+    # Segment
     notes = []
     if frames:
-        current = {"start": frames[0]["time"], "pitch": frames[0]["midi"], "amp": frames[0].get("amp", 0.5)}
+        current = {'start': frames[0]['time'], 'pitch': frames[0]['midi'], 'amp': frames[0]['amp']}
         for f in frames[1:]:
-            if f["midi"] != current["pitch"]:
-                dur = f["time"] - current["start"]
-                if dur >= NOTE_THRESHOLD:
+            if f['midi'] != current['pitch']:
+                dur = f['time'] - current['start']
+                if dur >= min_dur:
                     notes.append({
-                        "start": round(current["start"], 2),
-                        "dur": round(dur, 2),
-                        "pitch": current["pitch"],
-                        "velocity": min(127, int(current.get("amp", 0.5) * 127))
+                        'start': round(current['start'], 2),
+                        'dur': round(dur, 2),
+                        'pitch': current['pitch'],
+                        'velocity': min(127, int(current['amp'] * 127))
                     })
-                current = {"start": f["time"], "pitch": f["midi"], "amp": f.get("amp", 0.5)}
-        dur = duration - current["start"]
-        if dur >= NOTE_THRESHOLD:
+                current = {'start': f['time'], 'pitch': f['midi'], 'amp': f['amp']}
+        dur = len(audio) / SR - current['start']
+        if dur >= min_dur:
             notes.append({
-                "start": round(current["start"], 2),
-                "dur": round(dur, 2),
-                "pitch": current["pitch"],
-                "velocity": min(127, int(current.get("amp", 0.5) * 127))
+                'start': round(current['start'], 2),
+                'dur': round(dur, 2),
+                'pitch': current['pitch'],
+                'velocity': min(127, int(current['amp'] * 127))
             })
-
+    
     if not notes:
         return []
-
-    # Clamp to piano range
-    for n in notes:
-        n["pitch"] = max(21, min(108, n["pitch"]))
-
-    # Deduplicate adjacent same pitches
+    
+    # Deduplicate and merge close same-pitch notes
     deduped = [notes[0]]
     for n in notes[1:]:
-        if n["pitch"] != deduped[-1]["pitch"]:
+        if n['pitch'] == deduped[-1]['pitch'] and n['start'] - (deduped[-1]['start'] + deduped[-1]['dur']) < 0.15:
+            deduped[-1]['dur'] = round(n['start'] + n['dur'] - deduped[-1]['start'], 2)
+            deduped[-1]['velocity'] = max(deduped[-1]['velocity'], n['velocity'])
+        elif n['pitch'] != deduped[-1]['pitch']:
             deduped.append(n)
-
-    # Remove outlier short notes surrounded by long same notes
-    cleaned = []
-    for i, n in enumerate(deduped):
-        if i == 0 or i == len(deduped) - 1:
-            cleaned.append(n)
-            continue
-        prev_dur = deduped[i-1]["dur"]
-        next_dur = deduped[i+1]["dur"]
-        curr_dur = n["dur"]
-        # If this note is very short and neighbors are long and same pitch, skip
-        if curr_dur < 0.2 and prev_dur > 0.5 and next_dur > 0.5 and abs(deduped[i-1]["pitch"] - deduped[i+1]["pitch"]) <= 1:
-            continue
-        cleaned.append(n)
-
-    return cleaned
+    
+    return deduped
 
 
 def quantize_notes(notes, bpm=120):
     spq = 60.0 / bpm
-    grid = 0.125  # 1/8th note
+    grid = 0.125
     quantized = []
     for n in notes:
         qs = round((n["start"] / spq) / grid) * grid
@@ -410,12 +320,6 @@ def quantize_notes(notes, bpm=120):
             "velocity": n["velocity"]
         })
     return quantized
-
-
-def freq_to_midi(freq):
-    if freq <= 0:
-        return 0
-    return 69 + 12 * np.log2(freq / 440.0)
 
 
 def midi_to_name(midi):
@@ -444,14 +348,16 @@ def find_musescore():
     return None
 
 
-def generate_wav(notes, wav_path, sr=22050):
-    if not notes:
+def generate_wav(rh_notes, lh_notes, wav_path, sr=22050):
+    if not rh_notes and not lh_notes:
         return
-    total_dur = max(n["start"] + n["dur"] for n in notes)
+    
+    all_notes = rh_notes + lh_notes
+    total_dur = max(n["start"] + n["dur"] for n in all_notes)
     total_samples = int(total_dur * sr) + sr
     audio = np.zeros(total_samples, dtype=np.float32)
 
-    for n in notes:
+    for n in all_notes:
         freq = 440.0 * (2.0 ** ((n["pitch"] - 69) / 12.0))
         start_sample = int(n["start"] * sr)
         dur_samples = int(n["dur"] * sr)
@@ -459,9 +365,9 @@ def generate_wav(notes, wav_path, sr=22050):
             continue
 
         t = np.linspace(0, n["dur"], dur_samples, endpoint=False)
-        wave = 0.6 * np.sin(2 * np.pi * freq * t)
-        wave += 0.2 * np.sin(2 * np.pi * freq * 2 * t)
-        wave += 0.1 * np.sin(2 * np.pi * freq * 3 * t)
+        wave = 0.5 * np.sin(2 * np.pi * freq * t)
+        wave += 0.15 * np.sin(2 * np.pi * freq * 2 * t)
+        wave += 0.08 * np.sin(2 * np.pi * freq * 3 * t)
 
         attack = int(0.02 * sr)
         release = int(0.08 * sr)
@@ -506,43 +412,38 @@ def process_audio(job_id: str, input_path: Path):
         if len(audio) < N_FFT:
             raise ValueError("Аудио слишком короткое")
 
-        # Spectrogram for visualization
+        # Spectrogram
         set_stage(job_id, "fft")
         spec_uint8 = compute_spectrogram(audio, SR)
         spec_list = spec_uint8.tolist()
 
-        # Melody extraction
-        set_stage(job_id, "harmonic")
-        if HAS_LIBROSA:
-            logger.info(f"[{job_id}] Using librosa.pyin + HPSS")
-            frames = extract_melody_pyin(audio, SR)
-        else:
-            logger.info(f"[{job_id}] Using fallback FFT")
-            frames = extract_melody_fft(audio, SR)
-
-        if not frames:
-            raise ValueError("Не удалось извлечь мелодию")
+        # Extract two voices
+        set_stage(job_id, "voices")
+        lh_raw = extract_voice(audio, 80, 300, median_size=15, hysteresis=7, min_dur=0.30, amp_threshold=0.03)
+        rh_raw = extract_voice(audio, 300, 800, median_size=9, hysteresis=5, min_dur=0.20, amp_threshold=0.03)
 
         set_stage(job_id, "smooth")
-        notes = post_process_melody(frames, duration)
-
-        if not notes:
-            raise ValueError("Мелодия не выделена")
+        # Clamp to piano range
+        for n in lh_raw:
+            n["pitch"] = max(21, min(108, n["pitch"]))
+        for n in rh_raw:
+            n["pitch"] = max(21, min(108, n["pitch"]))
 
         set_stage(job_id, "quantize")
-        quantized = quantize_notes(notes, bpm=120)
+        lh_quantized = quantize_notes(lh_raw, bpm=120)
+        rh_quantized = quantize_notes(rh_raw, bpm=120)
 
         set_stage(job_id, "render")
         wav_path = Path(jobs[job_id]["wav_path"])
-        generate_wav(quantized, wav_path)
+        generate_wav(rh_quantized, lh_quantized, wav_path)
 
         set_stage(job_id, "done")
-        jobs[job_id]["melody"] = quantized
-        jobs[job_id]["fft"] = frames[::max(1, len(frames) // 300)]
+        jobs[job_id]["melody_rh"] = rh_quantized
+        jobs[job_id]["melody_lh"] = lh_quantized
         jobs[job_id]["spec"] = spec_list
         jobs[job_id]["duration"] = round(duration, 1)
         jobs[job_id]["status"] = "analyzed"
-        logger.info(f"[{job_id}] Готово: {len(quantized)} notes")
+        logger.info(f"[{job_id}] Готово: RH={len(rh_quantized)} LH={len(lh_quantized)}")
 
     except Exception as e:
         logger.error(f"[{job_id}] Ошибка: {e}", exc_info=True)
@@ -553,63 +454,76 @@ def process_audio(job_id: str, input_path: Path):
             input_path.unlink()
 
 
-def build_musicxml(notes, xml_path):
-    avg_pitch = sum(n["pitch"] for n in notes) / len(notes)
-    clef_sign = "F" if avg_pitch < 55 else "G"
-    clef_line = "4" if avg_pitch < 55 else "2"
-
+def build_musicxml(rh_notes, lh_notes, xml_path):
+    """Build MusicXML with two staves (grand staff): RH (treble) + LH (bass)"""
     root = Element('score-partwise', {'version': '3.1'})
+    
+    # Part list
     plist = SubElement(root, 'part-list')
-    sp = SubElement(plist, 'score-part', {'id': 'P1'})
-    SubElement(sp, 'part-name').text = 'Melody'
-
-    part = SubElement(root, 'part', {'id': 'P1'})
-    measures = {}
-
-    for n in notes:
+    
+    # RH part
+    sp1 = SubElement(plist, 'score-part', {'id': 'P1'})
+    SubElement(sp1, 'part-name').text = 'Right Hand'
+    sp2 = SubElement(plist, 'score-part', {'id': 'P2'})
+    SubElement(sp2, 'part-name').text = 'Left Hand'
+    
+    # Build measures for RH
+    part1 = SubElement(root, 'part', {'id': 'P1'})
+    measures_rh = {}
+    for n in rh_notes:
         m = int(n["start"] // 4.0)
         off = n["start"] % 4.0
         if off >= 3.999:
             m += 1
             off = 0.0
-        measures.setdefault(m, []).append({
+        measures_rh.setdefault(m, []).append({
             "offset": int(round(off * DIVISIONS)),
             "dur": int(round(n["dur"] * DIVISIONS)),
             "pitch": n["pitch"]
         })
-
-    for m_idx in sorted(measures.keys()):
-        measure = SubElement(part, 'measure', {'number': str(m_idx + 1)})
+    
+    for m_idx in sorted(measures_rh.keys()):
+        measure = SubElement(part1, 'measure', {'number': str(m_idx + 1)})
         if m_idx == 0:
             attr = SubElement(measure, 'attributes')
             SubElement(attr, 'divisions').text = str(DIVISIONS)
-            k = SubElement(attr, 'key')
-            SubElement(k, 'fifths').text = '0'
-            t = SubElement(attr, 'time')
-            SubElement(t, 'beats').text = '4'
-            SubElement(t, 'beat-type').text = '4'
-            c = SubElement(attr, 'clef')
-            SubElement(c, 'sign').text = clef_sign
-            SubElement(c, 'line').text = clef_line
-
-        events = sorted(measures[m_idx], key=lambda x: x['offset'])
+            staves = SubElement(attr, 'staves')
+            staves.text = '2'
+            # Treble clef for staff 1
+            clef1 = SubElement(attr, 'clef', {'number': '1'})
+            SubElement(clef1, 'sign').text = 'G'
+            SubElement(clef1, 'line').text = '2'
+            # Bass clef for staff 2
+            clef2 = SubElement(attr, 'clef', {'number': '2'})
+            SubElement(clef2, 'sign').text = 'F'
+            SubElement(clef2, 'line').text = '4'
+            # Key
+            key = SubElement(attr, 'key')
+            SubElement(key, 'fifths').text = '0'
+            # Time
+            time = SubElement(attr, 'time')
+            SubElement(time, 'beats').text = '4'
+            SubElement(time, 'beat-type').text = '4'
+        
+        events = sorted(measures_rh[m_idx], key=lambda x: x['offset'])
         last_end = 0
-
         for evt in events:
             off = evt['offset']
             dur = evt['dur']
             pitch = evt['pitch']
-
+            
             gap = off - last_end
             if gap >= 2:
                 r = SubElement(measure, 'note')
                 SubElement(r, 'rest')
                 SubElement(r, 'duration').text = str(gap)
+                staff_el = SubElement(r, 'staff')
+                staff_el.text = '1'
                 t, dot = dur_info(gap)
                 SubElement(r, 'type').text = t
                 if dot:
                     SubElement(r, 'dot')
-
+            
             step, alter, octv = midi_to_name(pitch)
             n = SubElement(measure, 'note')
             p = SubElement(n, 'pitch')
@@ -618,18 +532,106 @@ def build_musicxml(notes, xml_path):
                 SubElement(p, 'alter').text = str(alter)
             SubElement(p, 'octave').text = str(octv)
             SubElement(n, 'duration').text = str(dur)
+            staff_el = SubElement(n, 'staff')
+            staff_el.text = '1'
             t, dot = dur_info(dur)
             SubElement(n, 'type').text = t
             if dot:
                 SubElement(n, 'dot')
-
+            
             last_end = off + dur
-
+        
         fill = 32 - last_end
         if fill >= 2:
             r = SubElement(measure, 'note')
             SubElement(r, 'rest')
             SubElement(r, 'duration').text = str(fill)
+            staff_el = SubElement(r, 'staff')
+            staff_el.text = '1'
+            t, dot = dur_info(fill)
+            SubElement(r, 'type').text = t
+            if dot:
+                SubElement(r, 'dot')
+    
+    # Build measures for LH
+    part2 = SubElement(root, 'part', {'id': 'P2'})
+    measures_lh = {}
+    for n in lh_notes:
+        m = int(n["start"] // 4.0)
+        off = n["start"] % 4.0
+        if off >= 3.999:
+            m += 1
+            off = 0.0
+        measures_lh.setdefault(m, []).append({
+            "offset": int(round(off * DIVISIONS)),
+            "dur": int(round(n["dur"] * DIVISIONS)),
+            "pitch": n["pitch"]
+        })
+    
+    all_measures = sorted(set(list(measures_rh.keys()) + list(measures_lh.keys())))
+    
+    for m_idx in all_measures:
+        measure = SubElement(part2, 'measure', {'number': str(m_idx + 1)})
+        if m_idx == 0:
+            attr = SubElement(measure, 'attributes')
+            SubElement(attr, 'divisions').text = str(DIVISIONS)
+            staves = SubElement(attr, 'staves')
+            staves.text = '2'
+            clef1 = SubElement(attr, 'clef', {'number': '1'})
+            SubElement(clef1, 'sign').text = 'G'
+            SubElement(clef1, 'line').text = '2'
+            clef2 = SubElement(attr, 'clef', {'number': '2'})
+            SubElement(clef2, 'sign').text = 'F'
+            SubElement(clef2, 'line').text = '4'
+            key = SubElement(attr, 'key')
+            SubElement(key, 'fifths').text = '0'
+            time = SubElement(attr, 'time')
+            SubElement(time, 'beats').text = '4'
+            SubElement(time, 'beat-type').text = '4'
+        
+        events = sorted(measures_lh.get(m_idx, []), key=lambda x: x['offset'])
+        last_end = 0
+        for evt in events:
+            off = evt['offset']
+            dur = evt['dur']
+            pitch = evt['pitch']
+            
+            gap = off - last_end
+            if gap >= 2:
+                r = SubElement(measure, 'note')
+                SubElement(r, 'rest')
+                SubElement(r, 'duration').text = str(gap)
+                staff_el = SubElement(r, 'staff')
+                staff_el.text = '2'
+                t, dot = dur_info(gap)
+                SubElement(r, 'type').text = t
+                if dot:
+                    SubElement(r, 'dot')
+            
+            step, alter, octv = midi_to_name(pitch)
+            n = SubElement(measure, 'note')
+            p = SubElement(n, 'pitch')
+            SubElement(p, 'step').text = step
+            if alter != 0:
+                SubElement(p, 'alter').text = str(alter)
+            SubElement(p, 'octave').text = str(octv)
+            SubElement(n, 'duration').text = str(dur)
+            staff_el = SubElement(n, 'staff')
+            staff_el.text = '2'
+            t, dot = dur_info(dur)
+            SubElement(n, 'type').text = t
+            if dot:
+                SubElement(n, 'dot')
+            
+            last_end = off + dur
+        
+        fill = 32 - last_end
+        if fill >= 2:
+            r = SubElement(measure, 'note')
+            SubElement(r, 'rest')
+            SubElement(r, 'duration').text = str(fill)
+            staff_el = SubElement(r, 'staff')
+            staff_el.text = '2'
             t, dot = dur_info(fill)
             SubElement(r, 'type').text = t
             if dot:
