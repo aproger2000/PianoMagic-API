@@ -18,7 +18,7 @@ from scipy.ndimage import median_filter
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="PianoMagic API", version="4.2.2")
+app = FastAPI(title="PianoMagic API", version="4.2.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,12 +41,12 @@ SR = 22050
 HOP_MS = 50
 HOP = int(SR * HOP_MS / 1000)
 N_FFT = 4096
-MIN_AMP = 0.05
-NOTE_THRESHOLD = 0.15
-MELODY_MIN_FREQ = 300
-MELODY_MAX_FREQ = 1500
-HPF_CUTOFF = 500
-DIVISIONS = 2
+MIN_AMP = 0.03
+NOTE_THRESHOLD = 0.08
+MELODY_MIN_FREQ = 200
+MELODY_MAX_FREQ = 1200
+HPF_CUTOFF = 250
+DIVISIONS = 8
 
 NOTE_NAMES = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
 
@@ -64,7 +64,7 @@ STAGES = {
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "version": "4.2.2"}
+    return {"status": "ok", "version": "4.2.3"}
 
 
 @app.post("/analyze")
@@ -209,21 +209,47 @@ def compute_spectrogram(audio, sr, n_fft=2048, hop=512):
         frames.append(spec)
     if not frames:
         return np.zeros((n_fft // 2 + 1, 1))
-    spec = np.array(frames).T  # (freqs, time)
+    spec = np.array(frames).T
 
-    # Log scale, clip dynamic range to 60 dB
     spec_db = 20 * np.log10(spec + 1e-10)
     vmax = spec_db.max()
     spec_db = np.clip(spec_db, vmax - 60, vmax)
     spec_db = (spec_db - spec_db.min()) / (spec_db.max() - spec_db.min() + 1e-10)
 
-    # Downsample for transfer: target ~128 freq bins x ~200 time frames
     freq_step = max(1, spec_db.shape[0] // 128)
     time_step = max(1, spec_db.shape[1] // 200)
     spec_db = spec_db[::freq_step, ::time_step]
-
-    # Convert to uint8 for compact JSON
     return (spec_db * 255).astype(np.uint8)
+
+
+def find_melody_pitch(spectrum, freqs, min_f, max_f):
+    """Salience-based pitch detection: prefers fundamentals with harmonics"""
+    mask = (freqs >= min_f) & (freqs <= max_f)
+    mel_freqs = freqs[mask]
+    mel_spec = spectrum[mask]
+
+    if len(mel_spec) == 0:
+        return None, 0
+
+    # Compute salience: fundamental + weighted harmonics
+    salience = np.zeros_like(mel_spec)
+    for i, f in enumerate(mel_freqs):
+        s = mel_spec[i]
+        for h in [2, 3, 4]:
+            hf = f * h
+            if hf > freqs[-1]:
+                break
+            h_idx = np.argmin(np.abs(freqs - hf))
+            if h_idx < len(spectrum):
+                s += spectrum[h_idx] * (0.5 ** (h - 1))
+        salience[i] = s
+
+    idx = np.argmax(salience)
+    freq = mel_freqs[idx]
+    amp = mel_spec[idx]
+    global_max = np.max(spectrum) + 1e-10
+    amp_norm = min(1.0, amp / global_max)
+    return freq, amp_norm
 
 
 def freq_to_midi(freq):
@@ -241,12 +267,15 @@ def midi_to_name(midi):
 
 
 def dur_info(dur):
-    if dur >= 8: return 'whole', False
-    if dur == 6: return 'half', True
-    if dur >= 4: return 'half', False
-    if dur == 3: return 'quarter', True
-    if dur >= 2: return 'quarter', False
-    return 'eighth', False
+    """For divisions=8: 32=whole, 24=dotted-half, 16=half, 12=dotted-quarter, 8=quarter, 6=dotted-eighth, 4=eighth, 2=16th"""
+    if dur >= 28: return 'whole', False
+    if dur >= 20: return 'half', True
+    if dur >= 12: return 'half', False
+    if dur >= 10: return 'quarter', True
+    if dur >= 6: return 'quarter', False
+    if dur >= 5: return 'eighth', True
+    if dur >= 3: return 'eighth', False
+    return '16th', False
 
 
 def find_musescore():
@@ -276,7 +305,7 @@ def generate_wav(notes, wav_path, sr=22050):
         wave += 0.1 * np.sin(2 * np.pi * freq * 3 * t)
 
         attack = int(0.02 * sr)
-        release = int(0.1 * sr)
+        release = int(0.08 * sr)
         env = np.ones(dur_samples)
         if attack > 0:
             env[:attack] = np.linspace(0, 1, attack)
@@ -318,15 +347,15 @@ def process_audio(job_id: str, input_path: Path):
         if len(audio) < N_FFT:
             raise ValueError("Аудио слишком короткое")
 
-        # 1. Compute spectrogram from original (for visualization)
+        # 1. Spectrogram for visualization (from original)
         set_stage(job_id, "fft")
         spec_uint8 = compute_spectrogram(audio, SR)
         spec_list = spec_uint8.tolist()
 
-        # 2. Apply HPF to remove bass accompaniment
+        # 2. Apply HPF to reduce bass accompaniment
         audio_hp = apply_hpf(audio, HPF_CUTOFF, SR)
 
-        # 3. FFT analysis on filtered audio
+        # 3. FFT analysis with salience-based pitch detection
         freqs = np.fft.rfftfreq(N_FFT, 1 / SR)
         frames = []
 
@@ -334,26 +363,16 @@ def process_audio(job_id: str, input_path: Path):
             frame = audio_hp[i:i + N_FFT] * np.hanning(N_FFT)
             spectrum = np.abs(np.fft.rfft(frame))
 
-            mask = (freqs >= MELODY_MIN_FREQ) & (freqs <= MELODY_MAX_FREQ)
-            mel_freqs = freqs[mask]
-            mel_spec = spectrum[mask]
-
-            if len(mel_spec) == 0:
+            peak_freq, peak_amp = find_melody_pitch(spectrum, freqs, MELODY_MIN_FREQ, MELODY_MAX_FREQ)
+            if peak_freq is None:
                 continue
 
-            idx = np.argmax(mel_spec)
-            peak_freq = mel_freqs[idx]
-            peak_amp = mel_spec[idx]
-
-            global_max = np.max(spectrum) + 1e-10
-            amp_norm = min(1.0, peak_amp / global_max)
             time = i / SR
             midi = int(round(freq_to_midi(peak_freq)))
-
             frames.append({
                 "time": round(time, 3),
                 "freq": round(peak_freq, 1),
-                "amp": round(amp_norm, 3),
+                "amp": round(peak_amp, 3),
                 "midi": midi
             })
 
@@ -363,15 +382,15 @@ def process_audio(job_id: str, input_path: Path):
         set_stage(job_id, "harmonic")
         melody_raw = [f for f in frames if f["amp"] >= MIN_AMP]
 
-        # Median filter (size 11 = ~550ms)
-        if len(melody_raw) > 11:
+        # Median filter: 5 frames (~250ms) — enough to denoise, preserves rhythm
+        if len(melody_raw) > 5:
             pitches = [m["midi"] for m in melody_raw]
-            smoothed = median_filter(pitches, size=11)
+            smoothed = median_filter(pitches, size=5)
             for i, m in enumerate(melody_raw):
                 m["midi"] = int(smoothed[i])
 
-        # Hysteresis: min 5 frames (~250ms)
-        min_frames = 5
+        # Hysteresis: min 3 frames (~150ms)
+        min_frames = 3
         filtered = []
         if melody_raw:
             run_start = 0
@@ -417,7 +436,7 @@ def process_audio(job_id: str, input_path: Path):
         if not notes:
             raise ValueError("Мелодия не выделена")
 
-        # Clamp to piano range without octave shifting
+        # Clamp to piano range
         for n in notes:
             n["pitch"] = max(21, min(108, n["pitch"]))
 
@@ -431,10 +450,12 @@ def process_audio(job_id: str, input_path: Path):
         set_stage(job_id, "quantize")
         bpm = 120
         spq = 60.0 / bpm
+        # Quantize to 1/8th note grid (0.125 beats)
+        grid = 0.125
         quantized = []
         for n in notes:
-            qs = round((n["start"] / spq) / 0.25) * 0.25
-            qdur = max(0.25, round((n["dur"] / spq) / 0.25) * 0.25)
+            qs = round((n["start"] / spq) / grid) * grid
+            qdur = max(grid, round((n["dur"] / spq) / grid) * grid)
             qdur = min(4.0, qdur)
             quantized.append({
                 "start": qs,
@@ -453,7 +474,7 @@ def process_audio(job_id: str, input_path: Path):
         jobs[job_id]["spec"] = spec_list
         jobs[job_id]["duration"] = round(duration, 1)
         jobs[job_id]["status"] = "analyzed"
-        logger.info(f"[{job_id}] Готово")
+        logger.info(f"[{job_id}] Готово: {len(quantized)} notes")
 
     except Exception as e:
         logger.error(f"[{job_id}] Ошибка: {e}", exc_info=True)
@@ -512,7 +533,7 @@ def build_musicxml(notes, xml_path):
             pitch = evt['pitch']
 
             gap = off - last_end
-            if gap >= 1:
+            if gap >= 2:
                 r = SubElement(measure, 'note')
                 SubElement(r, 'rest')
                 SubElement(r, 'duration').text = str(gap)
@@ -536,8 +557,8 @@ def build_musicxml(notes, xml_path):
 
             last_end = off + dur
 
-        fill = 8 - last_end
-        if fill >= 1:
+        fill = 32 - last_end
+        if fill >= 2:
             r = SubElement(measure, 'note')
             SubElement(r, 'rest')
             SubElement(r, 'duration').text = str(fill)
