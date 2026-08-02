@@ -3,18 +3,17 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>PianoMagic 7.0 — Аудио в ноты</title>
+<title>PianoMagic 7.1 — Аудио в ноты</title>
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
 
 <div class="container">
     <header>
-        <h1>🎹 PianoMagic <span class="version">7.0</span></h1>
-        <p class="subtitle">Universal Melody Fitter — загрузите мелодию, получите фортепианную партию</p>
+        <h1>🎹 PianoMagic <span class="version">7.1</span></h1>
+        <p class="subtitle">Clean Melody Engine — загрузите мелодию, получите фортепианную партию</p>
     </header>
 
-    <!-- Upload Zone -->
     <div class="upload-zone" id="uploadZone">
         <div class="upload-icon">🎵</div>
         <p class="upload-text">Перетащите аудиофайл сюда</p>
@@ -23,7 +22,6 @@
         <button class="upload-btn" id="uploadBtn">Выбрать файл</button>
     </div>
 
-    <!-- Progress -->
     <div class="progress-section" id="progressSection" style="display:none">
         <div class="progress-bar-container">
             <div class="progress-bar" id="progressBar"></div>
@@ -40,16 +38,13 @@
         <p class="stage-text" id="stageText">Ожидание...</p>
     </div>
 
-    <!-- Error -->
     <div class="error-box" id="errorBox" style="display:none">
         <span class="error-icon">❌</span>
         <span id="errorText">Ошибка обработки</span>
     </div>
 
-    <!-- Results -->
     <div class="results" id="results" style="display:none">
 
-        <!-- Similarity Score -->
         <div class="similarity-card">
             <h3>🎯 Сходство с оригиналом</h3>
             <div class="similarity-value" id="similarityValue">—</div>
@@ -59,7 +54,6 @@
             <p class="similarity-label" id="similarityLabel">Ожидание...</p>
         </div>
 
-        <!-- Key & Tempo Info -->
         <div class="info-row">
             <div class="info-card">
                 <span class="info-label">Тональность</span>
@@ -75,19 +69,18 @@
             </div>
         </div>
 
-        <!-- Spectrogram -->
         <div class="section">
             <h3>📊 Спектрограмма</h3>
             <canvas id="specCanvas" width="800" height="256"></canvas>
         </div>
 
-        <!-- Real-time Staff -->
         <div class="section">
-            <h3>🎼 Нотный стан — мелодия в реальном времени</h3>
+            <h3>🎼 Нотный стан — нажмите ▶ для прослушивания</h3>
             <div class="staff-container">
-                <canvas id="staffCanvas" width="900" height="320"></canvas>
+                <canvas id="staffCanvas" width="900" height="340"></canvas>
                 <div class="staff-controls">
                     <button id="playStaffBtn">▶ Играть</button>
+                    <button id="stopStaffBtn" style="display:none">⏹ Стоп</button>
                     <span id="staffTime">0.0s / 0.0s</span>
                 </div>
                 <div class="staff-legend">
@@ -97,7 +90,6 @@
             </div>
         </div>
 
-        <!-- Chroma Comparison -->
         <div class="section">
             <h3>📊 Хромаграммное сравнение</h3>
             <div class="chroma-row">
@@ -116,17 +108,15 @@
             </div>
         </div>
 
-        <!-- Downloads -->
         <div class="downloads">
             <a id="downloadPdf" class="download-btn pdf" href="#" target="_blank">📄 Скачать PDF</a>
             <a id="downloadWav" class="download-btn wav" href="#" target="_blank">🔊 Скачать WAV</a>
         </div>
     </div>
 
-    <!-- Footer -->
     <footer>
         <div class="footer-versions">
-            <span>ФЭ: <strong id="feVersion">7.0</strong></span>
+            <span>ФЭ: <strong id="feVersion">7.1</strong></span>
             <span>БЭ: <strong id="beVersion">—</strong></span>
             <span class="api-status" id="apiStatus">API: проверка...</span>
         </div>
