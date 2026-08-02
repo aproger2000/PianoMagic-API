@@ -72,7 +72,7 @@ STAGES = {
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "version": "5.0.0", "engine": "librosa" if HAS_LIBROSA else "fallback"}
+    return {"status": "ok", "version": "6.1", "engine": "librosa" if HAS_LIBROSA else "fallback"}
 
 @app.post("/analyze")
 async def analyze(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
@@ -98,6 +98,8 @@ async def analyze(background_tasks: BackgroundTasks, file: UploadFile = File(...
         "spec": None,
         "duration": 0,
         "similarity": 0.0,
+        "chroma_orig": None,
+        "chroma_synth": None,
         "error": None
     }
     background_tasks.add_task(process_audio_v5, job_id, input_path)
@@ -131,6 +133,8 @@ async def get_melody(job_id: str):
         "spec": jobs[job_id]["spec"],
         "duration": jobs[job_id]["duration"],
         "similarity": jobs[job_id].get("similarity", 0.0),
+        "chroma_orig": jobs[job_id].get("chroma_orig"),
+        "chroma_synth": jobs[job_id].get("chroma_synth"),
     })
 
 @app.post("/render/{job_id}")
@@ -284,16 +288,11 @@ def process_audio_v5(job_id, input_path):
         set_stage(job_id, "fit")
         rh_notes, lh_notes = fit_piano_arrangement(melody_data)
 
-        # 5. Сличение отпечатков
-        set_stage(job_id, "compare")
-        similarity = compare_fingerprints(audio, sr, rh_notes, lh_notes, duration)
-        jobs[job_id]["similarity"] = round(similarity, 4)
-
-        # 6. Сохраняем
+        # 5. Сохраняем ноты
         jobs[job_id]["melody_rh"] = rh_notes
         jobs[job_id]["melody_lh"] = lh_notes
 
-        # 7. Авто-рендер
+        # 6. Рендер WAV (теперь ДО сравнения — тот же файл, что получит пользователь)
         set_stage(job_id, "render")
         xml_path = Path(jobs[job_id]["xml_path"])
         wav_path = Path(jobs[job_id]["wav_path"])
@@ -306,6 +305,13 @@ def process_audio_v5(job_id, input_path):
         if mscore:
             subprocess.run([mscore, "-o", str(pdf_path), str(xml_path)], 
                           capture_output=True, timeout=120)
+
+        # 7. Сличение отпечатков — сравниваем с ФИНАЛЬНЫМ WAV
+        set_stage(job_id, "compare")
+        similarity, chroma_orig_mean, chroma_synth_mean = compare_fingerprints(audio, sr, wav_path)
+        jobs[job_id]["similarity"] = round(similarity, 4)
+        jobs[job_id]["chroma_orig"] = chroma_orig_mean
+        jobs[job_id]["chroma_synth"] = chroma_synth_mean
 
         set_stage(job_id, "done")
         jobs[job_id]["status"] = "completed"
@@ -480,11 +486,11 @@ def fit_piano_arrangement(melody_data, strategy='adaptive'):
     return rh_notes, lh_notes
 
 
-def compare_fingerprints(original_audio, sr, rh_notes, lh_notes, duration):
-    """Сравнивает оригинал с синтезированным"""
+def compare_fingerprints(original_audio, sr, wav_path):
+    """Сравнивает оригинал с уже сгенерированным WAV"""
     try:
-        # Синтезируем кандидата
-        candidate = synthesize_for_comparison(rh_notes + lh_notes, duration, sr)
+        # Читаем финальный синтез
+        candidate, sr_cand = librosa.load(wav_path, sr=sr, mono=True)
 
         # Приводим к одной длине
         min_len = min(len(original_audio), len(candidate))
@@ -543,48 +549,16 @@ def compare_fingerprints(original_audio, sr, rh_notes, lh_notes, duration):
 
         total += mel_sim * 0.20
 
-        return min(1.0, max(0.0, total))
+        # Average chroma vectors for histograms
+        chroma_orig_mean = c_orig.mean(axis=1).tolist() if c_orig is not None else [0]*12
+        chroma_synth_mean = c_cand.mean(axis=1).tolist() if c_cand is not None else [0]*12
+
+        return min(1.0, max(0.0, total)), chroma_orig_mean, chroma_synth_mean
     except Exception as e:
         logger.warning(f"Fingerprint comparison failed: {e}")
         return 0.5
 
 
-def synthesize_for_comparison(notes, duration, sr=44100):
-    """Быстрый синтез для сравнения"""
-    samples = int(duration * sr)
-    audio = np.zeros(samples)
-
-    for n in notes:
-        t = np.arange(int(n['dur'] * sr)) / sr
-        if len(t) == 0:
-            continue
-        freq = 440.0 * (2.0 ** ((n['pitch'] - 69) / 12.0))
-        wave = (0.55 * np.sin(2*np.pi*freq*t) +
-                0.25 * np.sin(2*np.pi*freq*2*t) +
-                0.12 * np.sin(2*np.pi*freq*3*t))
-
-        attack, decay, release = int(0.008*sr), int(0.15*sr), int(0.08*sr)
-        sustain = 0.6
-        env = np.ones(len(t)) * sustain
-        if attack > 0:
-            env[:attack] = np.linspace(0, 1, attack)
-        if decay > 0 and attack+decay < len(t):
-            env[attack:attack+decay] = np.linspace(1, sustain, decay)
-        if release > 0 and len(t) > release:
-            env[-release:] = np.linspace(sustain, 0, release)
-
-        wave *= env
-        start = int(n['start'] * sr)
-        end = min(start + len(wave), samples)
-        audio[start:end] += wave[:end-start] * (n['velocity'] / 127.0)
-
-    peak = np.max(np.abs(audio))
-    return audio / peak * 0.85 if peak > 0 else audio
-
-
-# ============================================================
-# FALLBACK (если librosa не установлен)
-# ============================================================
 
 def extract_melody_fallback(audio, sr):
     """Старый метод для fallback"""
