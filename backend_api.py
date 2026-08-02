@@ -666,7 +666,7 @@ def build_musicxml_v71(rh: List[Dict], lh: List[Dict], xml_path: Path):
         if mi==0:
             at=SubElement(me,'attributes')
             SubElement(at,'divisions').text=str(DIV)
-            SubElement(SubElement(at,'staves')).text='2'
+            SubElement(at, 'staves').text = '2'
             c1=SubElement(at,'clef',{'number':'1'}); SubElement(c1,'sign').text='G'; SubElement(c1,'line').text='2'
             c2=SubElement(at,'clef',{'number':'2'}); SubElement(c2,'sign').text='F'; SubElement(c2,'line').text='4'
             SubElement(SubElement(at,'key'),'fifths').text='0'
