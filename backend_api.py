@@ -43,9 +43,13 @@ app.add_middleware(
         "*",
     ],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
+
+@app.options("/{path:path}")
+async def options_handler(path: str):
+    return JSONResponse({}, status_code=200)
 
 JOBS_DIR = Path("/tmp/pianomagic_jobs")
 JOBS_DIR.mkdir(exist_ok=True)
@@ -72,7 +76,7 @@ STAGES = {
 
 @app.get("/")
 async def root():
-    return {"status": "ok", "version": "6.1", "engine": "librosa" if HAS_LIBROSA else "fallback"}
+    return {"status": "ok", "version": "6.4", "engine": "librosa" if HAS_LIBROSA else "fallback"}
 
 @app.post("/analyze")
 async def analyze(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
@@ -347,10 +351,10 @@ def extract_melody_librosa(audio, sr):
     )
     onset_times = librosa.frames_to_time(onset_frames, sr=sr, hop_length=HOP_LENGTH)
 
-    # Pitch tracking
+    # Pitch tracking — expanded range C2-C8 for full piano spectrum
     pitches, mags = librosa.piptrack(
         y=y_harm, sr=sr, hop_length=HOP_LENGTH,
-        fmin=librosa.note_to_hz('C3'), fmax=librosa.note_to_hz('C7')
+        fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C8')
     )
 
     melody_events = []
@@ -366,7 +370,7 @@ def extract_melody_librosa(audio, sr):
         if best_pitch > 0 and best_mag > 0.005:
             midi = int(round(librosa.hz_to_midi(best_pitch)))
             end_time = onset_times[i+1] if i+1 < len(onset_times) else len(audio)/sr
-            note_dur = min(end_time - onset_times[i], beat_dur * 2)
+            note_dur = min(end_time - onset_times[i], beat_dur * 4)
             melody_events.append({
                 'time': onset_times[i], 'midi': midi,
                 'mag': best_mag, 'dur': note_dur
@@ -382,26 +386,18 @@ def extract_melody_librosa(audio, sr):
             last_midi = e['midi']
             last_time = e['time']
 
-    # Фильтруем верхний голос
-    high_voice = [e for e in simplified if e['midi'] >= 65]
+    # Use ALL voices, not just high — capture full melodic range
+    all_voice = simplified
 
-    # Квантизация по битам
-    beat_dur = 60.0 / tempo
-    quantized = {}
-    for e in high_voice:
-        beat = int(round(e['time'] / beat_dur))
-        if beat not in quantized or e['mag'] > quantized[beat]['mag']:
-            quantized[beat] = e
-
-    melody_beats = [quantized[b] for b in sorted(quantized.keys())]
-
-    # Убираем повторы
+    # Soft quantization: keep original timing but merge very close duplicates
+    # Gap tolerance reduced to 40ms to catch short notes
     final_melody = []
-    last_midi = -1
-    for e in melody_beats:
-        if e['midi'] != last_midi:
+    last_midi, last_time = -1, -1
+    for e in all_voice:
+        if e['midi'] != last_midi or (e['time'] - last_time) > 0.04:
             final_melody.append(e)
             last_midi = e['midi']
+            last_time = e['time']
 
     # Тональность
     chroma = librosa.feature.chroma_stft(y=audio, sr=sr, hop_length=HOP_LENGTH)
@@ -431,16 +427,14 @@ def fit_piano_arrangement(melody_data, strategy='adaptive'):
     rh_notes = []
     lh_notes = []
 
-    # Транспозиция в комфортный диапазон
-    melody_midis = [e['midi'] for e in melody]
-    center = (min(melody_midis) + max(melody_midis)) / 2
-    transpose = int(round(72 - center))
-    transpose = max(-12, min(12, transpose))
+    # No auto-transpose — preserve original octave
+    # Only clamp to full piano range (A0-C8)
+    transpose = 0
 
-    # Правая рука: мелодия
+    # Правая рука: мелодия — full range
     for i, e in enumerate(melody):
-        rh_pitch = max(60, min(96, e['midi'] + transpose))
-        dur = max(0.1, min(e['dur'], beat_dur * 1.5))
+        rh_pitch = max(21, min(108, e['midi'] + transpose))  # A0 to C8
+        dur = max(0.05, min(e['dur'], beat_dur * 2.0))  # shorter minimum, longer max
 
         rh_notes.append({
             'start': round(e['time'], 3),
