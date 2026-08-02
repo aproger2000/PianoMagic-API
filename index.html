@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>PianoMagic 7.0 — Аудио в ноты</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<div class="container">
+    <header>
+        <h1>🎹 PianoMagic <span class="version">7.0</span></h1>
+        <p class="subtitle">Universal Melody Fitter — загрузите мелодию, получите фортепианную партию</p>
+    </header>
+
+    <!-- Upload Zone -->
+    <div class="upload-zone" id="uploadZone">
+        <div class="upload-icon">🎵</div>
+        <p class="upload-text">Перетащите аудиофайл сюда</p>
+        <p class="upload-hint">MP3, WAV, FLAC, M4A, OGG до 50 МБ</p>
+        <input type="file" id="fileInput" accept=".mp3,.wav,.flac,.m4a,.ogg,audio/mpeg,audio/wav,audio/flac,audio/mp4,audio/ogg">
+        <button class="upload-btn" id="uploadBtn">Выбрать файл</button>
+    </div>
+
+    <!-- Progress -->
+    <div class="progress-section" id="progressSection" style="display:none">
+        <div class="progress-bar-container">
+            <div class="progress-bar" id="progressBar"></div>
+        </div>
+        <div class="progress-stages">
+            <div class="stage" data-stage="upload">Загрузка</div>
+            <div class="stage" data-stage="analyze">Анализ</div>
+            <div class="stage" data-stage="melody">Мелодия</div>
+            <div class="stage" data-stage="fit">Подбор</div>
+            <div class="stage" data-stage="compare">Сличение</div>
+            <div class="stage" data-stage="render">Рендер</div>
+            <div class="stage" data-stage="done">Готово</div>
+        </div>
+        <p class="stage-text" id="stageText">Ожидание...</p>
+    </div>
+
+    <!-- Error -->
+    <div class="error-box" id="errorBox" style="display:none">
+        <span class="error-icon">❌</span>
+        <span id="errorText">Ошибка обработки</span>
+    </div>
+
+    <!-- Results -->
+    <div class="results" id="results" style="display:none">
+
+        <!-- Similarity Score -->
+        <div class="similarity-card">
+            <h3>🎯 Сходство с оригиналом</h3>
+            <div class="similarity-value" id="similarityValue">—</div>
+            <div class="similarity-bar-container">
+                <div class="similarity-bar" id="similarityBar"></div>
+            </div>
+            <p class="similarity-label" id="similarityLabel">Ожидание...</p>
+        </div>
+
+        <!-- Key & Tempo Info -->
+        <div class="info-row">
+            <div class="info-card">
+                <span class="info-label">Тональность</span>
+                <span class="info-value" id="keyValue">—</span>
+            </div>
+            <div class="info-card">
+                <span class="info-label">Темп</span>
+                <span class="info-value" id="tempoValue">—</span>
+            </div>
+            <div class="info-card">
+                <span class="info-label">Длительность</span>
+                <span class="info-value" id="durationValue">—</span>
+            </div>
+        </div>
+
+        <!-- Spectrogram -->
+        <div class="section">
+            <h3>📊 Спектрограмма</h3>
+            <canvas id="specCanvas" width="800" height="256"></canvas>
+        </div>
+
+        <!-- Real-time Staff -->
+        <div class="section">
+            <h3>🎼 Нотный стан — мелодия в реальном времени</h3>
+            <div class="staff-container">
+                <canvas id="staffCanvas" width="900" height="320"></canvas>
+                <div class="staff-controls">
+                    <button id="playStaffBtn">▶ Играть</button>
+                    <span id="staffTime">0.0s / 0.0s</span>
+                </div>
+                <div class="staff-legend">
+                    <span class="legend-rh">🔴 Правая рука (мелодия)</span>
+                    <span class="legend-lh">🔵 Левая рука (аккомпанемент)</span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Chroma Comparison -->
+        <div class="section">
+            <h3>📊 Хромаграммное сравнение</h3>
+            <div class="chroma-row">
+                <div class="chroma-col">
+                    <h4>Оригинал</h4>
+                    <canvas id="chromaOrigCanvas" width="360" height="200"></canvas>
+                </div>
+                <div class="chroma-col">
+                    <h4>Синтез</h4>
+                    <canvas id="chromaSynthCanvas" width="360" height="200"></canvas>
+                </div>
+            </div>
+            <div class="chroma-stats">
+                <span>Корреляция Пирсона: <strong id="pearsonCorr">—</strong></span>
+                <span>Сходство тонального профиля: <strong id="profileSim">—</strong></span>
+            </div>
+        </div>
+
+        <!-- Downloads -->
+        <div class="downloads">
+            <a id="downloadPdf" class="download-btn pdf" href="#" target="_blank">📄 Скачать PDF</a>
+            <a id="downloadWav" class="download-btn wav" href="#" target="_blank">🔊 Скачать WAV</a>
+        </div>
+    </div>
+
+    <!-- Footer -->
+    <footer>
+        <div class="footer-versions">
+            <span>ФЭ: <strong id="feVersion">7.0</strong></span>
+            <span>БЭ: <strong id="beVersion">—</strong></span>
+            <span class="api-status" id="apiStatus">API: проверка...</span>
+        </div>
+    </footer>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
