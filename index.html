@@ -1,128 +1,126 @@
 <!DOCTYPE html>
 <html lang="ru">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-<title>PianoMagic 7.1 — Аудио в ноты</title>
-<link rel="stylesheet" href="styles.css">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PianoMagic v7.2 — Audio to Piano Score</title>
+    <link rel="stylesheet" href="styles.css">
 </head>
 <body>
+    <div class="container">
+        <!-- Header -->
+        <header>
+            <h1>🎹 PianoMagic</h1>
+            <p class="subtitle">Audio → Piano Score Transcription</p>
+            <span class="version-badge">v7.2</span>
+        </header>
 
-<div class="container">
-    <header>
-        <h1>🎹 PianoMagic <span class="version">7.1</span></h1>
-        <p class="subtitle">Clean Melody Engine — загрузите мелодию, получите фортепианную партию</p>
-    </header>
-
-    <div class="upload-zone" id="uploadZone">
-        <div class="upload-icon">🎵</div>
-        <p class="upload-text">Перетащите аудиофайл сюда</p>
-        <p class="upload-hint">MP3, WAV, FLAC, M4A, OGG до 50 МБ</p>
-        <input type="file" id="fileInput" accept=".mp3,.wav,.flac,.m4a,.ogg,audio/mpeg,audio/wav,audio/flac,audio/mp4,audio/ogg">
-        <button class="upload-btn" id="uploadBtn">Выбрать файл</button>
-    </div>
-
-    <div class="progress-section" id="progressSection" style="display:none">
-        <div class="progress-bar-container">
-            <div class="progress-bar" id="progressBar"></div>
-        </div>
-        <div class="progress-stages">
-            <div class="stage" data-stage="upload">Загрузка</div>
-            <div class="stage" data-stage="analyze">Анализ</div>
-            <div class="stage" data-stage="melody">Мелодия</div>
-            <div class="stage" data-stage="fit">Подбор</div>
-            <div class="stage" data-stage="compare">Сличение</div>
-            <div class="stage" data-stage="render">Рендер</div>
-            <div class="stage" data-stage="done">Готово</div>
-        </div>
-        <p class="stage-text" id="stageText">Ожидание...</p>
-    </div>
-
-    <div class="error-box" id="errorBox" style="display:none">
-        <span class="error-icon">❌</span>
-        <span id="errorText">Ошибка обработки</span>
-    </div>
-
-    <div class="results" id="results" style="display:none">
-
-        <div class="similarity-card">
-            <h3>🎯 Сходство с оригиналом</h3>
-            <div class="similarity-value" id="similarityValue">—</div>
-            <div class="similarity-bar-container">
-                <div class="similarity-bar" id="similarityBar"></div>
-            </div>
-            <p class="similarity-label" id="similarityLabel">Ожидание...</p>
-        </div>
-
-        <div class="info-row">
-            <div class="info-card">
-                <span class="info-label">Тональность</span>
-                <span class="info-value" id="keyValue">—</span>
-            </div>
-            <div class="info-card">
-                <span class="info-label">Темп</span>
-                <span class="info-value" id="tempoValue">—</span>
-            </div>
-            <div class="info-card">
-                <span class="info-label">Длительность</span>
-                <span class="info-value" id="durationValue">—</span>
+        <!-- Upload Area -->
+        <div class="upload-section" id="uploadSection">
+            <div class="drop-zone" id="dropZone">
+                <div class="drop-icon">🎵</div>
+                <p>Перетащите аудиофайл сюда</p>
+                <p class="small">или</p>
+                <label class="file-input-label">
+                    <input type="file" id="fileInput" accept=".mp3,.wav,.flac,.ogg,.m4a,audio/*" style="opacity:0;position:absolute;left:-9999px;">
+                    <span class="btn-primary">Выбрать файл</span>
+                </label>
+                <p class="formats">MP3, WAV, FLAC, OGG, M4A</p>
             </div>
         </div>
 
-        <div class="section">
-            <h3>📊 Спектрограмма</h3>
-            <canvas id="specCanvas" width="800" height="256"></canvas>
+        <!-- Progress Bar -->
+        <div class="progress-section hidden" id="progressSection">
+            <div class="progress-info">
+                <span id="progressStatus">Загрузка...</span>
+                <span id="progressPercent">0%</span>
+            </div>
+            <div class="progress-bar">
+                <div class="progress-fill" id="progressFill"></div>
+            </div>
+            <div class="progress-stages">
+                <div class="stage" data-stage="loading">📥 Загрузка</div>
+                <div class="stage" data-stage="analyzing">🔍 Анализ</div>
+                <div class="stage" data-stage="synthesizing">🎹 Синтез</div>
+                <div class="stage" data-stage="generating_score">🎼 Ноты</div>
+                <div class="stage" data-stage="completed">✅ Готово</div>
+            </div>
         </div>
 
-        <div class="section">
-            <h3>🎼 Нотный стан — нажмите ▶ для прослушивания</h3>
+        <!-- Results Section -->
+        <div class="results-section hidden" id="resultsSection">
+            <!-- Info Panel -->
+            <div class="info-panel">
+                <div class="info-item">
+                    <span class="info-label">🎵 Нот</span>
+                    <span class="info-value" id="noteCount">—</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">🎹 RH</span>
+                    <span class="info-value" id="rhCount">—</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">🎹 LH</span>
+                    <span class="info-value" id="lhCount">—</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">⏱️ Темп</span>
+                    <span class="info-value" id="tempoValue">—</span>
+                </div>
+                <div class="info-item">
+                    <span class="info-label">🎼 Тональность</span>
+                    <span class="info-value" id="keyValue">—</span>
+                </div>
+            </div>
+
+            <!-- Piano Roll / Staff -->
             <div class="staff-container">
-                <canvas id="staffCanvas" width="900" height="340"></canvas>
-                <div class="staff-controls">
-                    <button id="playStaffBtn">▶ Играть</button>
-                    <button id="stopStaffBtn" style="display:none">⏹ Стоп</button>
-                    <span id="staffTime">0.0s / 0.0s</span>
+                <div class="staff-header">
+                    <h3>🎼 Нотный стан</h3>
+                    <div class="staff-controls">
+                        <button id="playBtn" class="btn-control">▶️ Играть</button>
+                        <button id="stopBtn" class="btn-control">⏹ Стоп</button>
+                        <button id="zoomInBtn" class="btn-control">🔍+</button>
+                        <button id="zoomOutBtn" class="btn-control">🔍−</button>
+                    </div>
                 </div>
-                <div class="staff-legend">
-                    <span class="legend-rh">🔴 Правая рука (мелодия)</span>
-                    <span class="legend-lh">🔵 Левая рука (аккомпанемент)</span>
+                <div class="staff-wrapper">
+                    <canvas id="staffCanvas"></canvas>
+                    <div class="playhead" id="playhead"></div>
+                </div>
+                <div class="staff-timebar">
+                    <span id="currentTime">0:00</span>
+                    <input type="range" id="seekBar" min="0" max="100" value="0">
+                    <span id="totalTime">0:00</span>
+                </div>
+            </div>
+
+            <!-- Audio Player -->
+            <div class="player-section">
+                <h3>🔊 Результат синтеза</h3>
+                <audio id="audioPlayer" controls></audio>
+                <div class="download-buttons">
+                    <a id="downloadWav" class="btn-download" href="#" download>⬇️ Скачать WAV</a>
+                    <a id="downloadXml" class="btn-download" href="#" download>⬇️ Скачать MusicXML</a>
                 </div>
             </div>
         </div>
 
-        <div class="section">
-            <h3>📊 Хромаграммное сравнение</h3>
-            <div class="chroma-row">
-                <div class="chroma-col">
-                    <h4>Оригинал</h4>
-                    <canvas id="chromaOrigCanvas" width="360" height="200"></canvas>
+        <!-- Footer -->
+        <footer>
+            <div class="footer-content">
+                <div class="footer-left">
+                    <span class="footer-version">Frontend: <strong id="feVersion">v7.2</strong></span>
+                    <span class="footer-separator">|</span>
+                    <span class="footer-version">Backend: <strong id="beVersion">—</strong></span>
                 </div>
-                <div class="chroma-col">
-                    <h4>Синтез</h4>
-                    <canvas id="chromaSynthCanvas" width="360" height="200"></canvas>
+                <div class="footer-right">
+                    <span class="api-status" id="apiStatus">🟡 Проверка API...</span>
                 </div>
             </div>
-            <div class="chroma-stats">
-                <span>Корреляция Пирсона: <strong id="pearsonCorr">—</strong></span>
-                <span>Сходство тонального профиля: <strong id="profileSim">—</strong></span>
-            </div>
-        </div>
-
-        <div class="downloads">
-            <a id="downloadPdf" class="download-btn pdf" href="#" target="_blank">📄 Скачать PDF</a>
-            <a id="downloadWav" class="download-btn wav" href="#" target="_blank">🔊 Скачать WAV</a>
-        </div>
+        </footer>
     </div>
 
-    <footer>
-        <div class="footer-versions">
-            <span>ФЭ: <strong id="feVersion">7.1</strong></span>
-            <span>БЭ: <strong id="beVersion">—</strong></span>
-            <span class="api-status" id="apiStatus">API: проверка...</span>
-        </div>
-    </footer>
-</div>
-
-<script src="app.js"></script>
+    <script src="app.js"></script>
 </body>
 </html>
