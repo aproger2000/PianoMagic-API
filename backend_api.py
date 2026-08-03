@@ -243,6 +243,9 @@ def extract_melody_librosa_v72(y: np.ndarray, sr: int) -> TranscriptionResult:
     - No wait parameter
     """
     duration = librosa.get_duration(y=y, sr=sr)
+    if len(y) < 2048:
+        print(f"[EXTRACT WARN] Audio too short: {len(y)} samples")
+        return TranscriptionResult(notes=[], tempo=120.0, key="C major", duration=duration, sr=sr)
 
     # 1. PYIN with fine hop resolution
     hop_length = 256
@@ -298,8 +301,17 @@ def extract_melody_librosa_v72(y: np.ndarray, sr: int) -> TranscriptionResult:
     except Exception:
         pass
 
+    # Final validation: filter any invalid notes
+    clean_notes = []
+    for n in all_notes:
+        if n.end > n.start and np.isfinite(n.start) and np.isfinite(n.end) and 0 <= n.pitch_midi <= 127:
+            clean_notes.append(n)
+        else:
+            print(f"[EXTRACT SKIP] invalid note: start={n.start}, end={n.end}, midi={n.pitch_midi}")
+    print(f"[EXTRACT] {len(clean_notes)} clean notes returned")
+
     return TranscriptionResult(
-        notes=all_notes,
+        notes=clean_notes,
         tempo=tempo,
         key=key,
         duration=duration,
@@ -317,22 +329,35 @@ def synthesize_piano_v72(notes: List[Note], sr: int = 22050, duration: float = N
     if duration is None:
         duration = max((n.end for n in notes), default=1.0) + 1.0
 
+    # Guard against NaN/inf/negative
+    if not np.isfinite(duration) or duration <= 0:
+        duration = 2.0
     duration = max(duration, 0.5)  # minimum 0.5s
     total_samples = int(duration * sr)
     if total_samples <= 0:
+        print(f"[SYNTH WARN] total_samples={total_samples}, forcing fallback")
         return np.zeros((int(0.5 * sr), 2), dtype=np.float32)
     audio = np.zeros((total_samples, 2), dtype=np.float64)
+    print(f"[SYNTH] duration={duration:.3f}s, total_samples={total_samples}, notes={len(notes)}")
 
     # Inharmonicity coefficient
     B = 0.0003
 
+    valid_notes = []
     for note in notes:
         if note.pitch_midi < 21 or note.pitch_midi > 108:
             continue
-
-        # STRICT guard against negative/zero durations
         if note.end <= note.start:
+            print(f"[SYNTH SKIP] end<=start: {note.start:.3f} -> {note.end:.3f}")
             continue
+        if not np.isfinite(note.start) or not np.isfinite(note.end):
+            print(f"[SYNTH SKIP] non-finite: start={note.start}, end={note.end}")
+            continue
+        valid_notes.append(note)
+
+    print(f"[SYNTH] valid_notes={len(valid_notes)}/{len(notes)}")
+
+    for note in valid_notes:
 
         freq = librosa.midi_to_hz(note.pitch_midi)
         start_sample = int(note.start * sr)
@@ -658,8 +683,12 @@ async def process_audio(task_id: str, file_path: Path):
         tasks[task_id]['status'] = 'synthesizing'
         tasks[task_id]['progress'] = 60
 
+        # Ensure valid duration for synthesis
+        synth_dur = result.duration if np.isfinite(result.duration) and result.duration > 0 else duration
+        print(f"[PROCESS] synth_dur={synth_dur:.3f}s, notes={len(result.notes)}")
+
         # Synthesize
-        synth_audio = synthesize_piano_v72(result.notes, sr=sr, duration=duration)
+        synth_audio = synthesize_piano_v72(result.notes, sr=sr, duration=synth_dur)
 
         tasks[task_id]['status'] = 'generating_score'
         tasks[task_id]['progress'] = 80
@@ -672,6 +701,9 @@ async def process_audio(task_id: str, file_path: Path):
         wav_path = UPLOAD_DIR / f"PianoMagic_{file_id}.wav"
         xml_path = UPLOAD_DIR / f"PianoMagic_{file_id}.xml"
 
+        if synth_audio.size == 0:
+            print("[WARN] synth_audio is empty, writing silence fallback")
+            synth_audio = np.zeros((int(0.5 * sr), 2), dtype=np.float32)
         sf.write(str(wav_path), synth_audio, sr)
         with open(xml_path, 'w', encoding='utf-8') as f:
             f.write(musicxml)
