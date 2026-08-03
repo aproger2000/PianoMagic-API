@@ -165,7 +165,7 @@ def segment_pitch_contour(
                 if semitone_diff > pitch_jump_st:
                     note_end = times[i]
                     dur_ms = (note_end - note_start) * 1000
-                    if dur_ms >= min_dur_ms:
+                    if dur_ms >= min_dur_ms and note_end > note_start:
                         notes.append(Note(
                             start=note_start,
                             end=note_end,
@@ -183,7 +183,7 @@ def segment_pitch_contour(
                 if pause_ms > pause_thresh_ms or j >= len(times):
                     note_end = times[i]
                     dur_ms = (note_end - note_start) * 1000
-                    if dur_ms >= min_dur_ms:
+                    if dur_ms >= min_dur_ms and note_end > note_start:
                         notes.append(Note(
                             start=note_start,
                             end=note_end,
@@ -195,7 +195,7 @@ def segment_pitch_contour(
     if in_note:
         note_end = times[-1]
         dur_ms = (note_end - note_start) * 1000
-        if dur_ms >= min_dur_ms:
+        if dur_ms >= min_dur_ms and note_end > note_start:
             notes.append(Note(
                 start=note_start,
                 end=note_end,
@@ -317,7 +317,10 @@ def synthesize_piano_v72(notes: List[Note], sr: int = 22050, duration: float = N
     if duration is None:
         duration = max((n.end for n in notes), default=1.0) + 1.0
 
+    duration = max(duration, 0.5)  # minimum 0.5s
     total_samples = int(duration * sr)
+    if total_samples <= 0:
+        return np.zeros((int(0.5 * sr), 2), dtype=np.float32)
     audio = np.zeros((total_samples, 2), dtype=np.float64)
 
     # Inharmonicity coefficient
@@ -325,6 +328,10 @@ def synthesize_piano_v72(notes: List[Note], sr: int = 22050, duration: float = N
 
     for note in notes:
         if note.pitch_midi < 21 or note.pitch_midi > 108:
+            continue
+
+        # STRICT guard against negative/zero durations
+        if note.end <= note.start:
             continue
 
         freq = librosa.midi_to_hz(note.pitch_midi)
@@ -584,35 +591,50 @@ def generate_musicxml_v72(result: TranscriptionResult, title: str = "PianoMagic 
 # ───────────────────────────────────────────────────────────────
 def compare_audio_features(original_y: np.ndarray, synth_y: np.ndarray, sr: int) -> dict:
     """Compute similarity metrics between original and synthesized audio."""
-    # Ensure same length
+    # Ensure same length and non-empty
     min_len = min(len(original_y), len(synth_y))
+    if min_len < 512:
+        return {
+            'chroma_correlation': 0.0,
+            'spectral_contrast_correlation': 0.0,
+            'onset_correlation': 0.0,
+            'overall_similarity': 0.0
+        }
     orig = original_y[:min_len]
     synth = synth_y[:min_len]
 
-    # Chroma
-    chroma_orig = librosa.feature.chroma_stft(y=orig, sr=sr)
-    chroma_synth = librosa.feature.chroma_stft(y=synth, sr=sr)
-    chroma_corr = np.corrcoef(chroma_orig.mean(axis=1), chroma_synth.mean(axis=1))[0, 1]
+    try:
+        # Chroma
+        chroma_orig = librosa.feature.chroma_stft(y=orig, sr=sr)
+        chroma_synth = librosa.feature.chroma_stft(y=synth, sr=sr)
+        chroma_corr = np.corrcoef(chroma_orig.mean(axis=1), chroma_synth.mean(axis=1))[0, 1]
 
-    # Spectral contrast
-    sc_orig = librosa.feature.spectral_contrast(y=orig, sr=sr)
-    sc_synth = librosa.feature.spectral_contrast(y=synth, sr=sr)
-    sc_corr = np.corrcoef(sc_orig.mean(axis=1), sc_synth.mean(axis=1))[0, 1]
+        # Spectral contrast
+        sc_orig = librosa.feature.spectral_contrast(y=orig, sr=sr)
+        sc_synth = librosa.feature.spectral_contrast(y=synth, sr=sr)
+        sc_corr = np.corrcoef(sc_orig.mean(axis=1), sc_synth.mean(axis=1))[0, 1]
 
-    # Onset
-    onset_orig = librosa.onset.onset_strength(y=orig, sr=sr)
-    onset_synth = librosa.onset.onset_strength(y=synth, sr=sr)
-    onset_corr = np.corrcoef(onset_orig, onset_synth)[0, 1]
+        # Onset
+        onset_orig = librosa.onset.onset_strength(y=orig, sr=sr)
+        onset_synth = librosa.onset.onset_strength(y=synth, sr=sr)
+        onset_corr = np.corrcoef(onset_orig, onset_synth)[0, 1]
 
-    # Overall
-    overall = np.mean([chroma_corr, sc_corr, onset_corr])
+        # Overall
+        overall = np.mean([chroma_corr, sc_corr, onset_corr])
 
-    return {
-        'chroma_correlation': round(float(chroma_corr), 3),
-        'spectral_contrast_correlation': round(float(sc_corr), 3),
-        'onset_correlation': round(float(onset_corr), 3),
-        'overall_similarity': round(float(overall), 3)
-    }
+        return {
+            'chroma_correlation': round(float(chroma_corr), 3),
+            'spectral_contrast_correlation': round(float(sc_corr), 3),
+            'onset_correlation': round(float(onset_corr), 3),
+            'overall_similarity': round(float(overall), 3)
+        }
+    except Exception:
+        return {
+            'chroma_correlation': 0.0,
+            'spectral_contrast_correlation': 0.0,
+            'onset_correlation': 0.0,
+            'overall_similarity': 0.0
+        }
 
 # ───────────────────────────────────────────────────────────────
 # Background Task: Transcription
@@ -654,8 +676,16 @@ async def process_audio(task_id: str, file_path: Path):
         with open(xml_path, 'w', encoding='utf-8') as f:
             f.write(musicxml)
 
-        # Compare features
-        comparison = compare_audio_features(y, synth_audio[:, 0], sr)
+        # Compare features (non-critical)
+        try:
+            comparison = compare_audio_features(y, synth_audio[:, 0], sr)
+        except Exception:
+            comparison = {
+                'chroma_correlation': 0.0,
+                'spectral_contrast_correlation': 0.0,
+                'onset_correlation': 0.0,
+                'overall_similarity': 0.0
+            }
 
         tasks[task_id]['status'] = 'completed'
         tasks[task_id]['progress'] = 100
