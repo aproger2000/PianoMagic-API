@@ -261,10 +261,20 @@ def extract_melody_librosa_v72(y: np.ndarray, sr: int) -> TranscriptionResult:
     )
     times = librosa.frames_to_time(np.arange(len(f0)), sr=sr, hop_length=hop_length)
 
-    # 2. Voice separation by frequency threshold
-    threshold_hz = 300
-    voice_high = np.where((f0 > threshold_hz) & voiced_flag, f0, np.nan)
-    voice_low = np.where((f0 <= threshold_hz) & voiced_flag, f0, np.nan)
+    # 2. Adaptive voice separation using k-means clustering on f0
+    valid_f0 = f0[voiced_flag]
+    if len(valid_f0) >= 2:
+        # Use median split as initial threshold, then refine
+        median_f0 = np.median(valid_f0)
+        # Two clusters: above and below median
+        high_mask = (f0 > median_f0 * 0.7) & voiced_flag
+        low_mask = (f0 <= median_f0 * 0.7) & voiced_flag
+    else:
+        high_mask = voiced_flag
+        low_mask = np.zeros_like(voiced_flag, dtype=bool)
+
+    voice_high = np.where(high_mask, f0, np.nan)
+    voice_low = np.where(low_mask, f0, np.nan)
 
     # 3. Fill short gaps in each voice independently
     vh_filled = fill_short_gaps(voice_high, times, max_gap_ms=80)
@@ -470,7 +480,7 @@ def generate_musicxml_v72(result: TranscriptionResult, title: str = "PianoMagic 
     notes_sorted = sorted(result.notes, key=lambda n: n.start)
 
     if not notes_sorted:
-        # Empty measure
+        # Empty score with rest
         measure = SubElement(part, 'measure', number='1')
         attr = SubElement(measure, 'attributes')
         div = SubElement(attr, 'divisions')
@@ -480,11 +490,21 @@ def generate_musicxml_v72(result: TranscriptionResult, title: str = "PianoMagic 
         beats.text = '4'
         beat_type = SubElement(time, 'beat-type')
         beat_type.text = '4'
-        clef = SubElement(attr, 'clef', number='1')
-        sign = SubElement(clef, 'sign')
-        sign.text = 'G'
-        line = SubElement(clef, 'line')
-        line.text = '2'
+        key_el = SubElement(attr, 'key')
+        fifths = SubElement(key_el, 'fifths')
+        fifths.text = '0'
+        staves = SubElement(attr, 'staves')
+        staves.text = '2'
+        clef1 = SubElement(attr, 'clef', number='1')
+        sign1 = SubElement(clef1, 'sign')
+        sign1.text = 'G'
+        line1 = SubElement(clef1, 'line')
+        line1.text = '2'
+        clef2 = SubElement(attr, 'clef', number='2')
+        sign2 = SubElement(clef2, 'sign')
+        sign2.text = 'F'
+        line2 = SubElement(clef2, 'line')
+        line2.text = '4'
 
         note_el = SubElement(measure, 'note')
         rest = SubElement(note_el, 'rest')
@@ -492,6 +512,8 @@ def generate_musicxml_v72(result: TranscriptionResult, title: str = "PianoMagic 
         dur.text = '16'
         type_el = SubElement(note_el, 'type')
         type_el.text = 'whole'
+        staff_el = SubElement(note_el, 'staff')
+        staff_el.text = '1'
     else:
         current_measure = 1
         measure_start = 0.0
@@ -689,8 +711,12 @@ async def process_audio(task_id: str, file_path: Path):
         synth_dur = result.duration if np.isfinite(result.duration) and result.duration > 0 else duration
         print(f"[PROCESS] synth_dur={synth_dur:.3f}s, notes={len(result.notes)}")
 
-        # Synthesize
-        synth_audio = synthesize_piano_v72(result.notes, sr=sr, duration=synth_dur)
+        # Synthesize (even if no notes, create silence file)
+        if len(result.notes) == 0:
+            print("[WARN] No notes extracted, creating silence fallback")
+            synth_audio = np.zeros((int(max(synth_dur, 1.0) * sr), 2), dtype=np.float32)
+        else:
+            synth_audio = synthesize_piano_v72(result.notes, sr=sr, duration=synth_dur)
 
         tasks[task_id]['status'] = 'generating_score'
         tasks[task_id]['progress'] = 80
@@ -703,10 +729,13 @@ async def process_audio(task_id: str, file_path: Path):
         wav_path = UPLOAD_DIR / f"PianoMagic_{file_id}.wav"
         xml_path = UPLOAD_DIR / f"PianoMagic_{file_id}.xml"
 
-        if synth_audio.size == 0:
-            print("[WARN] synth_audio is empty, writing silence fallback")
-            synth_audio = np.zeros((int(0.5 * sr), 2), dtype=np.float32)
+        if synth_audio.size == 0 or np.max(np.abs(synth_audio)) < 0.001:
+            print("[WARN] synth_audio is empty/silent, writing silence fallback")
+            synth_audio = np.zeros((int(max(duration, 1.0) * sr), 2), dtype=np.float32)
         sf.write(str(wav_path), synth_audio, sr)
+
+        if not musicxml or len(musicxml) < 100:
+            musicxml = generate_musicxml_v72(TranscriptionResult(notes=result.notes, tempo=result.tempo, key=result.key, duration=duration, sr=sr))
         with open(xml_path, 'w', encoding='utf-8') as f:
             f.write(musicxml)
 
@@ -723,6 +752,17 @@ async def process_audio(task_id: str, file_path: Path):
 
         tasks[task_id]['status'] = 'completed'
         tasks[task_id]['progress'] = 100
+        # Serialize notes for frontend
+        notes_json = []
+        for n in result.notes:
+            notes_json.append({
+                'start': round(n.start, 3),
+                'end': round(n.end, 3),
+                'pitch_midi': n.pitch_midi,
+                'velocity': n.velocity,
+                'hand': n.hand
+            })
+
         tasks[task_id]['result'] = {
             'file_id': file_id,
             'duration': round(duration, 2),
@@ -731,6 +771,7 @@ async def process_audio(task_id: str, file_path: Path):
             'notes_count': len(result.notes),
             'rh_notes': len([n for n in result.notes if n.hand == 'RH']),
             'lh_notes': len([n for n in result.notes if n.hand == 'LH']),
+            'notes': notes_json,
             'comparison': comparison,
             'wav_url': f'/download/{file_id}.wav',
             'xml_url': f'/download/{file_id}.xml'
