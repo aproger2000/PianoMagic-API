@@ -127,6 +127,8 @@ def fill_short_gaps(voice: np.ndarray, times: np.ndarray, max_gap_ms: float = 80
     sr = 22050  # assumed
     hop_length = 256
     for gs, ge in zip(gap_starts, gap_ends):
+        if ge <= gs:
+            continue  # skip invalid pair (e.g. all-valid voice)
         gap_dur_ms = (ge - gs) * hop_length / sr * 1000
         if gap_dur_ms <= max_gap_ms and gs > 0 and ge < len(voice):
             result[gs:ge] = np.linspace(voice[gs-1], voice[ge], ge - gs)
@@ -738,7 +740,10 @@ async def process_audio(task_id: str, file_path: Path):
         tasks[task_id]['status'] = 'error'
         tasks[task_id]['error'] = str(e)
         import traceback
-        tasks[task_id]['traceback'] = traceback.format_exc()
+        tb = traceback.format_exc()
+        tasks[task_id]['traceback'] = tb
+        print(f"[PROCESS ERROR] task={task_id}: {e}")
+        print(tb)
 
 # ───────────────────────────────────────────────────────────────
 # API Endpoints
