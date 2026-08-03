@@ -1,7 +1,6 @@
 """
 PianoMagic Backend API — v7.2
 Audio-to-piano-score transcription with continuous pitch contour segmentation
-and two-voice separation.
 """
 
 import os
@@ -9,6 +8,7 @@ import io
 import uuid
 import asyncio
 import tempfile
+import traceback
 from pathlib import Path
 from typing import Optional, List, Dict
 from dataclasses import dataclass, field
@@ -20,22 +20,20 @@ from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
-# MusicXML generation
 from xml.etree.ElementTree import Element, SubElement, tostring
 from xml.dom import minidom
 
-# Audio processing
 import soundfile as sf
-from scipy import signal
+from scipy.ndimage import median_filter
 
 # ───────────────────────────────────────────────────────────────
 # Configuration
 # ───────────────────────────────────────────────────────────────
 VERSION = "7.2.0"
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "pianomagic_uploads"
-UPLOAD_DIR.mkdir(exist_ok=True)
+UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+print(f"[INIT] UPLOAD_DIR={UPLOAD_DIR}, exists={UPLOAD_DIR.exists()}")
 
-# Task storage (in-memory; for production use Redis)
 tasks: Dict[str, dict] = {}
 
 # ───────────────────────────────────────────────────────────────
@@ -60,11 +58,11 @@ app.add_middleware(
 # ───────────────────────────────────────────────────────────────
 @dataclass
 class Note:
-    start: float      # seconds
-    end: float        # seconds
+    start: float
+    end: float
     pitch_midi: int
     velocity: int = 80
-    hand: str = "RH"  # "RH" or "LH"
+    hand: str = "RH"
 
 @dataclass
 class TranscriptionResult:
@@ -83,7 +81,6 @@ def midi_to_note_name(midi: int) -> str:
     return f"{names[midi % 12]}{octave}"
 
 def midi_to_ly_step(midi: int) -> tuple:
-    """Return step, alter, octave for MusicXML."""
     names = ['C', 'C', 'D', 'D', 'E', 'F', 'F', 'G', 'G', 'A', 'A', 'B']
     alters = [0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0]
     octave = (midi // 12) - 1
@@ -91,16 +88,14 @@ def midi_to_ly_step(midi: int) -> tuple:
     return names[idx], alters[idx], octave
 
 def estimate_key(chroma: np.ndarray) -> str:
-    """Krumhansl-Schmuckler key estimation."""
     profiles = {
         'C major': [6.35, 2.23, 3.48, 2.33, 4.38, 4.09, 2.52, 5.19, 2.39, 3.66, 2.29, 2.88],
         'C minor': [6.33, 2.68, 3.52, 5.38, 2.60, 3.53, 2.54, 4.75, 3.98, 2.69, 3.34, 3.17],
     }
-    # Rotate to all keys
     all_profiles = {}
     for i in range(12):
         for mode, prof in profiles.items():
-            key_name = librosa.midi_to_note(i + 60)[:-1]  # Remove octave
+            key_name = librosa.midi_to_note(i + 60)[:-1]
             if mode == 'C major':
                 all_profiles[f"{key_name} major"] = np.roll(prof, i)
             else:
@@ -111,10 +106,22 @@ def estimate_key(chroma: np.ndarray) -> str:
     return max(correlations, key=correlations.get)
 
 # ───────────────────────────────────────────────────────────────
-# Core Algorithm: v7.2 — Continuous Pitch Contour Segmentation
+# Core Algorithm: v7.2
 # ───────────────────────────────────────────────────────────────
+def smooth_pitch(voice: np.ndarray, window: int = 5) -> np.ndarray:
+    """Apply median filter to smooth pitch contour."""
+    valid = ~np.isnan(voice)
+    if np.sum(valid) < window:
+        return voice
+    result = voice.copy()
+    # Only smooth valid regions
+    valid_indices = np.where(valid)[0]
+    if len(valid_indices) >= window:
+        smoothed = median_filter(voice[valid_indices], size=window, mode='nearest')
+        result[valid_indices] = smoothed
+    return result
+
 def fill_short_gaps(voice: np.ndarray, times: np.ndarray, max_gap_ms: float = 80) -> np.ndarray:
-    """Interpolate short gaps in a pitch contour."""
     result = voice.copy()
     valid = ~np.isnan(voice)
     if np.sum(valid) < 2:
@@ -124,11 +131,11 @@ def fill_short_gaps(voice: np.ndarray, times: np.ndarray, max_gap_ms: float = 80
     gap_starts = np.where(gaps == -1)[0]
     gap_ends = np.where(gaps == 1)[0]
 
-    sr = 22050  # assumed
+    sr = 22050
     hop_length = 256
     for gs, ge in zip(gap_starts, gap_ends):
         if ge <= gs:
-            continue  # skip invalid pair (e.g. all-valid voice)
+            continue
         gap_dur_ms = (ge - gs) * hop_length / sr * 1000
         if gap_dur_ms <= max_gap_ms and gs > 0 and ge < len(voice):
             result[gs:ge] = np.linspace(voice[gs-1], voice[ge], ge - gs)
@@ -138,17 +145,13 @@ def segment_pitch_contour(
     filled_voice: np.ndarray,
     times: np.ndarray,
     hand: str,
-    min_dur_ms: float = 60,
-    pause_thresh_ms: float = 100,
-    pitch_jump_st: float = 0.5
+    min_dur_ms: float = 80,
+    pause_thresh_ms: float = 200,
+    pitch_jump_st: float = 1.0
 ) -> List[Note]:
     """
-    Segment a continuous pitch contour into discrete notes.
-
-    Rules:
-    - New note when pitch jumps > 0.5 semitones
-    - New note when gap > pause_thresh_ms
-    - Filter notes shorter than min_dur_ms
+    Segment pitch contour into notes.
+    v7.2 fix: increased thresholds to avoid note fragmentation.
     """
     notes = []
     in_note = False
@@ -207,43 +210,23 @@ def segment_pitch_contour(
 
     return notes
 
-def merge_close_notes(notes: List[Note], max_gap_ms: float = 80, max_pitch_diff_st: float = 1.0) -> List[Note]:
-    """Merge consecutive notes of same pitch with small gaps."""
+def merge_close_notes(notes: List[Note], max_gap_ms: float = 100, max_pitch_diff_st: float = 1.0) -> List[Note]:
     if not notes:
         return notes
-
     notes_sorted = sorted(notes, key=lambda n: n.start)
     merged = [notes_sorted[0]]
-
     for note in notes_sorted[1:]:
         last = merged[-1]
         gap_ms = (note.start - last.end) * 1000
         pitch_diff = abs(note.pitch_midi - last.pitch_midi)
-
         if gap_ms < max_gap_ms and pitch_diff <= max_pitch_diff_st and last.hand == note.hand:
-            # Merge
             last.end = note.end
             last.pitch_midi = int(round((last.pitch_midi + note.pitch_midi) / 2))
         else:
             merged.append(note)
-
     return merged
 
-def prune_salient_notes(notes: List[Note], min_dur_ms: float = 60) -> List[Note]:
-    """Remove very short notes that are likely artifacts."""
-    return [n for n in notes if (n.end - n.start) * 1000 >= min_dur_ms]
-
 def extract_melody_librosa_v72(y: np.ndarray, sr: int) -> TranscriptionResult:
-    """
-    v7.2: Continuous pitch contour segmentation with two-voice separation.
-
-    Key changes from v7.1:
-    - No onset-based detection; uses continuous f0 tracking
-    - Two voices separated by 300Hz threshold
-    - No octave correction (preserves real melodic leaps)
-    - min_dur reduced to 60ms
-    - No wait parameter
-    """
     duration = librosa.get_duration(y=y, sr=sr)
     if len(y) < 2048:
         print(f"[EXTRACT WARN] Audio too short: {len(y)} samples")
@@ -251,6 +234,7 @@ def extract_melody_librosa_v72(y: np.ndarray, sr: int) -> TranscriptionResult:
 
     # 1. PYIN with fine hop resolution
     hop_length = 256
+    print(f"[EXTRACT] Running PYIN, hop={hop_length}...")
     f0, voiced_flag, voiced_probs = librosa.pyin(
         y,
         fmin=librosa.note_to_hz('C2'),
@@ -260,37 +244,42 @@ def extract_melody_librosa_v72(y: np.ndarray, sr: int) -> TranscriptionResult:
         frame_length=2048
     )
     times = librosa.frames_to_time(np.arange(len(f0)), sr=sr, hop_length=hop_length)
+    print(f"[EXTRACT] PYIN done: {np.sum(voiced_flag)} voiced frames out of {len(f0)}")
 
-    # 2. Adaptive voice separation using k-means clustering on f0
+    # 2. Adaptive voice separation
     valid_f0 = f0[voiced_flag]
     if len(valid_f0) >= 2:
-        # Use median split as initial threshold, then refine
         median_f0 = np.median(valid_f0)
-        # Two clusters: above and below median
-        high_mask = (f0 > median_f0 * 0.7) & voiced_flag
-        low_mask = (f0 <= median_f0 * 0.7) & voiced_flag
+        threshold = median_f0 * 0.7
+        print(f"[EXTRACT] Adaptive threshold: {threshold:.1f} Hz (median={median_f0:.1f})")
+        high_mask = (f0 > threshold) & voiced_flag
+        low_mask = (f0 <= threshold) & voiced_flag
     else:
         high_mask = voiced_flag
         low_mask = np.zeros_like(voiced_flag, dtype=bool)
 
     voice_high = np.where(high_mask, f0, np.nan)
     voice_low = np.where(low_mask, f0, np.nan)
+    print(f"[EXTRACT] High voice frames: {np.sum(high_mask)}, Low: {np.sum(low_mask)}")
 
-    # 3. Fill short gaps in each voice independently
+    # 3. Fill short gaps
     vh_filled = fill_short_gaps(voice_high, times, max_gap_ms=80)
     vl_filled = fill_short_gaps(voice_low, times, max_gap_ms=80)
 
-    # 4. Segment each voice into notes
-    notes_high = segment_pitch_contour(vh_filled, times, hand="RH", min_dur_ms=60, pause_thresh_ms=100)
-    notes_low = segment_pitch_contour(vl_filled, times, hand="LH", min_dur_ms=60, pause_thresh_ms=100)
+    # 4. Smooth pitch contours (NEW: reduce vibrato artifacts)
+    vh_smooth = smooth_pitch(vh_filled, window=5)
+    vl_smooth = smooth_pitch(vl_filled, window=5)
 
-    # 5. Merge close notes within each hand
-    notes_high = merge_close_notes(notes_high, max_gap_ms=80, max_pitch_diff_st=1.0)
-    notes_low = merge_close_notes(notes_low, max_gap_ms=80, max_pitch_diff_st=1.0)
+    # 5. Segment with relaxed thresholds (v7.2 fix)
+    print("[EXTRACT] Segmenting voices...")
+    notes_high = segment_pitch_contour(vh_smooth, times, hand="RH", min_dur_ms=80, pause_thresh_ms=200, pitch_jump_st=1.0)
+    notes_low = segment_pitch_contour(vl_smooth, times, hand="LH", min_dur_ms=80, pause_thresh_ms=200, pitch_jump_st=1.0)
+    print(f"[EXTRACT] Raw segments: RH={len(notes_high)}, LH={len(notes_low)}")
 
-    # 6. Prune very short artifacts
-    notes_high = prune_salient_notes(notes_high, min_dur_ms=60)
-    notes_low = prune_salient_notes(notes_low, min_dur_ms=60)
+    # 6. Merge close notes
+    notes_high = merge_close_notes(notes_high, max_gap_ms=100, max_pitch_diff_st=1.0)
+    notes_low = merge_close_notes(notes_low, max_gap_ms=100, max_pitch_diff_st=1.0)
+    print(f"[EXTRACT] After merge: RH={len(notes_high)}, LH={len(notes_low)}")
 
     # 7. Combine and sort
     all_notes = sorted(notes_high + notes_low, key=lambda n: n.start)
@@ -313,13 +302,11 @@ def extract_melody_librosa_v72(y: np.ndarray, sr: int) -> TranscriptionResult:
     except Exception:
         pass
 
-    # Final validation: filter any invalid notes
+    # Final validation
     clean_notes = []
     for n in all_notes:
         if n.end > n.start and np.isfinite(n.start) and np.isfinite(n.end) and 0 <= n.pitch_midi <= 127:
             clean_notes.append(n)
-        else:
-            print(f"[EXTRACT SKIP] invalid note: start={n.start}, end={n.end}, midi={n.pitch_midi}")
     print(f"[EXTRACT] {len(clean_notes)} clean notes returned")
 
     return TranscriptionResult(
@@ -334,71 +321,61 @@ def extract_melody_librosa_v72(y: np.ndarray, sr: int) -> TranscriptionResult:
 # Synthesis
 # ───────────────────────────────────────────────────────────────
 def synthesize_piano_v72(notes: List[Note], sr: int = 22050, duration: float = None) -> np.ndarray:
-    """
-    Inharmonic piano synthesis with ADSR envelope and stereo panning.
-    v7.2: Updated for two-voice output.
-    """
     if duration is None:
         duration = max((n.end for n in notes), default=1.0) + 1.0
 
-    # Guard against NaN/inf/negative
     if not np.isfinite(duration) or duration <= 0:
         duration = 2.0
-    duration = max(duration, 0.5)  # minimum 0.5s
+    duration = max(duration, 0.5)
+
     total_samples = int(duration * sr)
     if total_samples <= 0:
         print(f"[SYNTH WARN] total_samples={total_samples}, forcing fallback")
         return np.zeros((int(0.5 * sr), 2), dtype=np.float32)
-    audio = np.zeros((total_samples, 2), dtype=np.float64)
-    print(f"[SYNTH] duration={duration:.3f}s, total_samples={total_samples}, notes={len(notes)}")
 
-    # Inharmonicity coefficient
-    B = 0.0003
+    print(f"[SYNTH] duration={duration:.3f}s, total_samples={total_samples}, input_notes={len(notes)}")
+    audio = np.zeros((total_samples, 2), dtype=np.float64)
 
     valid_notes = []
     for note in notes:
         if note.pitch_midi < 21 or note.pitch_midi > 108:
             continue
         if note.end <= note.start:
-            print(f"[SYNTH SKIP] end<=start: {note.start:.3f} -> {note.end:.3f}")
             continue
         if not np.isfinite(note.start) or not np.isfinite(note.end):
-            print(f"[SYNTH SKIP] non-finite: start={note.start}, end={note.end}")
             continue
         valid_notes.append(note)
 
-    print(f"[SYNTH] valid_notes={len(valid_notes)}/{len(notes)}")
+    print(f"[SYNTH] valid_notes={len(valid_notes)}")
+
+    B = 0.0003
+    harmonic_amps = [1.0, 0.5, 0.25, 0.125, 0.06, 0.03, 0.015]
 
     for note in valid_notes:
-
         freq = librosa.midi_to_hz(note.pitch_midi)
         start_sample = int(note.start * sr)
-        end_sample = int(note.end * sr)
+        end_sample = min(int(note.end * sr), total_samples)
         note_samples = end_sample - start_sample
 
         if note_samples <= 0:
             continue
 
         t = np.arange(note_samples) / sr
-
-        # Inharmonic partials
-        harmonic_amps = [1.0, 0.5, 0.25, 0.125, 0.06, 0.03, 0.015]
         note_audio = np.zeros(note_samples)
 
         for h, amp in enumerate(harmonic_amps, 1):
-            # Inharmonic frequency: f_n = n * f0 * sqrt(1 + B * n^2)
             f_h = h * freq * np.sqrt(1 + B * h**2)
             phase = np.cumsum(2 * np.pi * f_h / sr * np.ones(note_samples))
             note_audio += amp * np.sin(phase)
 
-        # ADSR envelope
-        attack = int(0.01 * sr)
-        decay = int(0.1 * sr)
+        # ADSR
+        attack = min(int(0.01 * sr), note_samples // 4)
+        decay = min(int(0.1 * sr), note_samples // 3)
         sustain_level = 0.7
-        release = int(0.05 * sr)
+        release = min(int(0.05 * sr), note_samples // 4)
 
         envelope = np.ones(note_samples) * sustain_level
-        if attack > 0 and attack < note_samples:
+        if attack > 0:
             envelope[:attack] = np.linspace(0, 1, attack)
         if decay > 0 and attack + decay < note_samples:
             envelope[attack:attack+decay] = np.linspace(1, sustain_level, decay)
@@ -407,29 +384,24 @@ def synthesize_piano_v72(notes: List[Note], sr: int = 22050, duration: float = N
 
         note_audio *= envelope
 
-        # Stereo panning: RH right, LH left
         pan = 0.7 if note.hand == "RH" else 0.3
         left_amp = np.sqrt(1 - pan)
         right_amp = np.sqrt(pan)
 
-        if start_sample + note_samples <= total_samples:
-            audio[start_sample:start_sample+note_samples, 0] += note_audio * left_amp
-            audio[start_sample:start_sample+note_samples, 1] += note_audio * right_amp
+        audio[start_sample:end_sample, 0] += note_audio * left_amp
+        audio[start_sample:end_sample, 1] += note_audio * right_amp
 
-    # Normalize
     max_amp = np.max(np.abs(audio))
     if max_amp > 0:
         audio = audio / max_amp * 0.9
 
-    # Simple reverb (comb filter)
+    # Reverb
     reverb = np.zeros_like(audio)
     delay_samples = int(0.05 * sr)
-    decay = 0.3
     if delay_samples < len(audio):
-        reverb[delay_samples:] = audio[:-delay_samples] * decay
+        reverb[delay_samples:] = audio[:-delay_samples] * 0.3
     audio = audio + reverb * 0.3
 
-    # Final normalize
     max_amp = np.max(np.abs(audio))
     if max_amp > 0:
         audio = audio / max_amp * 0.95
@@ -437,93 +409,66 @@ def synthesize_piano_v72(notes: List[Note], sr: int = 22050, duration: float = N
     return audio.astype(np.float32)
 
 # ───────────────────────────────────────────────────────────────
-# MusicXML Generation
+# MusicXML
 # ───────────────────────────────────────────────────────────────
 def generate_musicxml_v72(result: TranscriptionResult, title: str = "PianoMagic Transcription") -> str:
-    """Generate MusicXML string from transcription result."""
-
-    # Root
     score = Element('score-partwise', version='3.1')
 
-    # Work
     work = SubElement(score, 'work')
     work_title = SubElement(work, 'work-title')
     work_title.text = title
 
-    # Identification
     ident = SubElement(score, 'identification')
     creator = SubElement(ident, 'creator', type='software')
     creator.text = f'PianoMagic v{VERSION}'
 
-    # Part list
     part_list = SubElement(score, 'part-list')
     score_part = SubElement(part_list, 'score-part', id='P1')
     part_name = SubElement(score_part, 'part-name')
     part_name.text = 'Piano'
 
-    # MIDI instrument
     midi_inst = SubElement(score_part, 'midi-instrument', id='P1-I1')
-    midi_ch = SubElement(midi_inst, 'midi-channel')
-    midi_ch.text = '1'
-    midi_prog = SubElement(midi_inst, 'midi-program')
-    midi_prog.text = '1'
+    SubElement(midi_inst, 'midi-channel').text = '1'
+    SubElement(midi_inst, 'midi-program').text = '1'
 
-    # Part
     part = SubElement(score, 'part', id='P1')
 
-    # Group notes by measure (4/4, tempo-based)
     beats_per_measure = 4
     seconds_per_beat = 60.0 / result.tempo
     measure_duration = beats_per_measure * seconds_per_beat
 
-    # Sort notes
     notes_sorted = sorted(result.notes, key=lambda n: n.start)
+    divisions = 4
 
     if not notes_sorted:
-        # Empty score with rest
         measure = SubElement(part, 'measure', number='1')
         attr = SubElement(measure, 'attributes')
-        div = SubElement(attr, 'divisions')
-        div.text = '4'
+        SubElement(attr, 'divisions').text = '4'
         time = SubElement(attr, 'time')
-        beats = SubElement(time, 'beats')
-        beats.text = '4'
-        beat_type = SubElement(time, 'beat-type')
-        beat_type.text = '4'
+        SubElement(time, 'beats').text = '4'
+        SubElement(time, 'beat-type').text = '4'
         key_el = SubElement(attr, 'key')
-        fifths = SubElement(key_el, 'fifths')
-        fifths.text = '0'
-        staves = SubElement(attr, 'staves')
-        staves.text = '2'
+        SubElement(key_el, 'fifths').text = '0'
+        SubElement(attr, 'staves').text = '2'
         clef1 = SubElement(attr, 'clef', number='1')
-        sign1 = SubElement(clef1, 'sign')
-        sign1.text = 'G'
-        line1 = SubElement(clef1, 'line')
-        line1.text = '2'
+        SubElement(clef1, 'sign').text = 'G'
+        SubElement(clef1, 'line').text = '2'
         clef2 = SubElement(attr, 'clef', number='2')
-        sign2 = SubElement(clef2, 'sign')
-        sign2.text = 'F'
-        line2 = SubElement(clef2, 'line')
-        line2.text = '4'
+        SubElement(clef2, 'sign').text = 'F'
+        SubElement(clef2, 'line').text = '4'
 
         note_el = SubElement(measure, 'note')
-        rest = SubElement(note_el, 'rest')
-        dur = SubElement(note_el, 'duration')
-        dur.text = '16'
-        type_el = SubElement(note_el, 'type')
-        type_el.text = 'whole'
-        staff_el = SubElement(note_el, 'staff')
-        staff_el.text = '1'
+        SubElement(note_el, 'rest')
+        SubElement(note_el, 'duration').text = '16'
+        SubElement(note_el, 'type').text = 'whole'
+        SubElement(note_el, 'staff').text = '1'
     else:
         current_measure = 1
         measure_start = 0.0
         measure = None
         attr_set = False
 
-        divisions = 4  # quarter = 4 divisions
-
         for note in notes_sorted:
-            # Check if new measure needed
             while note.start >= measure_start + measure_duration:
                 current_measure += 1
                 measure_start += measure_duration
@@ -534,80 +479,49 @@ def generate_musicxml_v72(result: TranscriptionResult, title: str = "PianoMagic 
 
                 if not attr_set:
                     attr = SubElement(measure, 'attributes')
-                    div = SubElement(attr, 'divisions')
-                    div.text = str(divisions)
+                    SubElement(attr, 'divisions').text = str(divisions)
 
                     if current_measure == 1:
                         time = SubElement(attr, 'time')
-                        beats = SubElement(time, 'beats')
-                        beats.text = '4'
-                        beat_type = SubElement(time, 'beat-type')
-                        beat_type.text = '4'
+                        SubElement(time, 'beats').text = '4'
+                        SubElement(time, 'beat-type').text = '4'
 
                         key = SubElement(attr, 'key')
-                        fifths = SubElement(key, 'fifths')
-                        # Simple key signature mapping
-                        key_map = {
-                            'C major': 0, 'G major': 1, 'D major': 2, 'A major': 3,
-                            'E major': 4, 'B major': 5, 'F# major': 6,
-                            'F major': -1, 'Bb major': -2, 'Eb major': -3,
-                            'A minor': 0, 'E minor': 1, 'D minor': -1,
-                            'G minor': -2, 'C minor': -3
-                        }
-                        fifths.text = str(key_map.get(result.key, 0))
+                        SubElement(key, 'fifths').text = '0'
 
-                        # Two staves
-                        staves = SubElement(attr, 'staves')
-                        staves.text = '2'
+                        SubElement(attr, 'staves').text = '2'
 
-                        # Treble clef
                         clef1 = SubElement(attr, 'clef', number='1')
-                        sign1 = SubElement(clef1, 'sign')
-                        sign1.text = 'G'
-                        line1 = SubElement(clef1, 'line')
-                        line1.text = '2'
+                        SubElement(clef1, 'sign').text = 'G'
+                        SubElement(clef1, 'line').text = '2'
 
-                        # Bass clef
                         clef2 = SubElement(attr, 'clef', number='2')
-                        sign2 = SubElement(clef2, 'sign')
-                        sign2.text = 'F'
-                        line2 = SubElement(clef2, 'line')
-                        line2.text = '4'
+                        SubElement(clef2, 'sign').text = 'F'
+                        SubElement(clef2, 'line').text = '4'
 
-                        # Tempo
                         direction = SubElement(measure, 'direction', placement='above')
-                        direction_type = SubElement(direction, 'direction-type')
-                        metronome = SubElement(direction_type, 'metronome')
-                        beat_unit = SubElement(metronome, 'beat-unit')
-                        beat_unit.text = 'quarter'
-                        per_min = SubElement(metronome, 'per-minute')
-                        per_min.text = str(int(result.tempo))
+                        dt = SubElement(direction, 'direction-type')
+                        metro = SubElement(dt, 'metronome')
+                        SubElement(metro, 'beat-unit').text = 'quarter'
+                        SubElement(metro, 'per-minute').text = str(int(result.tempo))
 
                     attr_set = True
 
-            # Calculate duration in divisions
             note_dur = note.end - note.start
             dur_divs = max(1, int(round(note_dur / seconds_per_beat * divisions)))
 
             note_el = SubElement(measure, 'note')
-
-            # Staff: RH=1, LH=2
             staff_num = '1' if note.hand == 'RH' else '2'
 
             step, alter, octave = midi_to_ly_step(note.pitch_midi)
             pitch_el = SubElement(note_el, 'pitch')
-            step_el = SubElement(pitch_el, 'step')
-            step_el.text = step
+            SubElement(pitch_el, 'step').text = step
             if alter != 0:
-                alter_el = SubElement(pitch_el, 'alter')
-                alter_el.text = str(alter)
-            octave_el = SubElement(pitch_el, 'octave')
-            octave_el.text = str(octave)
+                SubElement(pitch_el, 'alter').text = str(alter)
+            SubElement(pitch_el, 'octave').text = str(octave)
 
-            dur_el = SubElement(note_el, 'duration')
-            dur_el.text = str(dur_divs)
+            SubElement(note_el, 'duration').text = str(dur_divs)
 
-            # Note type approximation
             type_name = 'quarter'
             if dur_divs >= 16:
                 type_name = 'whole'
@@ -617,58 +531,40 @@ def generate_musicxml_v72(result: TranscriptionResult, title: str = "PianoMagic 
                 type_name = 'quarter'
             elif dur_divs >= 2:
                 type_name = 'eighth'
-            elif dur_divs >= 1:
+            else:
                 type_name = '16th'
 
-            type_el = SubElement(note_el, 'type')
-            type_el.text = type_name
+            SubElement(note_el, 'type').text = type_name
+            SubElement(note_el, 'staff').text = staff_num
+            SubElement(note_el, 'voice').text = staff_num
 
-            staff_el = SubElement(note_el, 'staff')
-            staff_el.text = staff_num
-
-            # Voice
-            voice_el = SubElement(note_el, 'voice')
-            voice_el.text = staff_num
-
-    # Pretty print
     rough = tostring(score, encoding='unicode')
     reparsed = minidom.parseString(rough)
     return reparsed.toprettyxml(indent='  ')
 
 # ───────────────────────────────────────────────────────────────
-# Comparison (kept for backend, removed from frontend display)
+# Comparison
 # ───────────────────────────────────────────────────────────────
 def compare_audio_features(original_y: np.ndarray, synth_y: np.ndarray, sr: int) -> dict:
-    """Compute similarity metrics between original and synthesized audio."""
-    # Ensure same length and non-empty
     min_len = min(len(original_y), len(synth_y))
     if min_len < 512:
-        return {
-            'chroma_correlation': 0.0,
-            'spectral_contrast_correlation': 0.0,
-            'onset_correlation': 0.0,
-            'overall_similarity': 0.0
-        }
+        return {'chroma_correlation': 0.0, 'spectral_contrast_correlation': 0.0, 'onset_correlation': 0.0, 'overall_similarity': 0.0}
     orig = original_y[:min_len]
     synth = synth_y[:min_len]
 
     try:
-        # Chroma
         chroma_orig = librosa.feature.chroma_stft(y=orig, sr=sr)
         chroma_synth = librosa.feature.chroma_stft(y=synth, sr=sr)
         chroma_corr = np.corrcoef(chroma_orig.mean(axis=1), chroma_synth.mean(axis=1))[0, 1]
 
-        # Spectral contrast
         sc_orig = librosa.feature.spectral_contrast(y=orig, sr=sr)
         sc_synth = librosa.feature.spectral_contrast(y=synth, sr=sr)
         sc_corr = np.corrcoef(sc_orig.mean(axis=1), sc_synth.mean(axis=1))[0, 1]
 
-        # Onset
         onset_orig = librosa.onset.onset_strength(y=orig, sr=sr)
         onset_synth = librosa.onset.onset_strength(y=synth, sr=sr)
         onset_corr = np.corrcoef(onset_orig, onset_synth)[0, 1]
 
-        # Overall
         overall = np.mean([chroma_corr, sc_corr, onset_corr])
 
         return {
@@ -678,81 +574,69 @@ def compare_audio_features(original_y: np.ndarray, synth_y: np.ndarray, sr: int)
             'overall_similarity': round(float(overall), 3)
         }
     except Exception:
-        return {
-            'chroma_correlation': 0.0,
-            'spectral_contrast_correlation': 0.0,
-            'onset_correlation': 0.0,
-            'overall_similarity': 0.0
-        }
+        return {'chroma_correlation': 0.0, 'spectral_contrast_correlation': 0.0, 'onset_correlation': 0.0, 'overall_similarity': 0.0}
 
 # ───────────────────────────────────────────────────────────────
-# Background Task: Transcription
+# Background Task
 # ───────────────────────────────────────────────────────────────
 async def process_audio(task_id: str, file_path: Path):
-    """Main transcription pipeline."""
     try:
         tasks[task_id]['status'] = 'loading'
         tasks[task_id]['progress'] = 10
+        print(f"[TASK {task_id}] Loading audio from {file_path}")
 
-        # Load audio
         y, sr = librosa.load(str(file_path), sr=22050, mono=True)
         duration = librosa.get_duration(y=y, sr=sr)
+        print(f"[TASK {task_id}] Audio loaded: {duration:.2f}s, {len(y)} samples")
 
         tasks[task_id]['status'] = 'analyzing'
         tasks[task_id]['progress'] = 30
 
-        # Transcribe
         result = extract_melody_librosa_v72(y, sr)
+        print(f"[TASK {task_id}] Extracted {len(result.notes)} notes")
 
         tasks[task_id]['status'] = 'synthesizing'
         tasks[task_id]['progress'] = 60
 
-        # Ensure valid duration for synthesis
         synth_dur = result.duration if np.isfinite(result.duration) and result.duration > 0 else duration
-        print(f"[PROCESS] synth_dur={synth_dur:.3f}s, notes={len(result.notes)}")
+        print(f"[TASK {task_id}] Synthesizing, dur={synth_dur:.3f}s")
 
-        # Synthesize (even if no notes, create silence file)
         if len(result.notes) == 0:
-            print("[WARN] No notes extracted, creating silence fallback")
+            print(f"[TASK {task_id}] WARN: No notes, creating silence")
             synth_audio = np.zeros((int(max(synth_dur, 1.0) * sr), 2), dtype=np.float32)
         else:
             synth_audio = synthesize_piano_v72(result.notes, sr=sr, duration=synth_dur)
 
+        print(f"[TASK {task_id}] Synthesis done, shape={synth_audio.shape}, max={np.max(np.abs(synth_audio)):.4f}")
+
         tasks[task_id]['status'] = 'generating_score'
         tasks[task_id]['progress'] = 80
 
-        # Generate MusicXML
         musicxml = generate_musicxml_v72(result)
+        print(f"[TASK {task_id}] MusicXML generated, len={len(musicxml)}")
 
         # Save files
         file_id = task_id
         wav_path = UPLOAD_DIR / f"PianoMagic_{file_id}.wav"
         xml_path = UPLOAD_DIR / f"PianoMagic_{file_id}.xml"
 
-        if synth_audio.size == 0 or np.max(np.abs(synth_audio)) < 0.001:
-            print("[WARN] synth_audio is empty/silent, writing silence fallback")
-            synth_audio = np.zeros((int(max(duration, 1.0) * sr), 2), dtype=np.float32)
+        print(f"[TASK {task_id}] Saving WAV to {wav_path}")
         sf.write(str(wav_path), synth_audio, sr)
+        print(f"[TASK {task_id}] WAV saved, size={wav_path.stat().st_size} bytes")
 
-        if not musicxml or len(musicxml) < 100:
-            musicxml = generate_musicxml_v72(TranscriptionResult(notes=result.notes, tempo=result.tempo, key=result.key, duration=duration, sr=sr))
+        print(f"[TASK {task_id}] Saving XML to {xml_path}")
         with open(xml_path, 'w', encoding='utf-8') as f:
             f.write(musicxml)
+        print(f"[TASK {task_id}] XML saved, size={xml_path.stat().st_size} bytes")
 
-        # Compare features (non-critical)
+        # Compare
         try:
-            comparison = compare_audio_features(y, synth_audio[:, 0], sr)
-        except Exception:
-            comparison = {
-                'chroma_correlation': 0.0,
-                'spectral_contrast_correlation': 0.0,
-                'onset_correlation': 0.0,
-                'overall_similarity': 0.0
-            }
+            comparison = compare_audio_features(y, synth_audio[:, 0] if synth_audio.ndim > 1 else synth_audio, sr)
+        except Exception as e:
+            print(f"[TASK {task_id}] Compare error: {e}")
+            comparison = {'chroma_correlation': 0.0, 'spectral_contrast_correlation': 0.0, 'onset_correlation': 0.0, 'overall_similarity': 0.0}
 
-        tasks[task_id]['status'] = 'completed'
-        tasks[task_id]['progress'] = 100
-        # Serialize notes for frontend
+        # Serialize notes
         notes_json = []
         for n in result.notes:
             notes_json.append({
@@ -763,6 +647,8 @@ async def process_audio(task_id: str, file_path: Path):
                 'hand': n.hand
             })
 
+        tasks[task_id]['status'] = 'completed'
+        tasks[task_id]['progress'] = 100
         tasks[task_id]['result'] = {
             'file_id': file_id,
             'duration': round(duration, 2),
@@ -776,14 +662,14 @@ async def process_audio(task_id: str, file_path: Path):
             'wav_url': f'/download/{file_id}.wav',
             'xml_url': f'/download/{file_id}.xml'
         }
+        print(f"[TASK {task_id}] COMPLETED")
 
     except Exception as e:
         tasks[task_id]['status'] = 'error'
         tasks[task_id]['error'] = str(e)
-        import traceback
         tb = traceback.format_exc()
         tasks[task_id]['traceback'] = tb
-        print(f"[PROCESS ERROR] task={task_id}: {e}")
+        print(f"[TASK {task_id}] ERROR: {e}")
         print(tb)
 
 # ───────────────────────────────────────────────────────────────
@@ -791,11 +677,7 @@ async def process_audio(task_id: str, file_path: Path):
 # ───────────────────────────────────────────────────────────────
 @app.get("/")
 async def root():
-    return {
-        "service": "PianoMagic API",
-        "version": VERSION,
-        "status": "running"
-    }
+    return {"service": "PianoMagic API", "version": VERSION, "status": "running"}
 
 @app.get("/version")
 async def get_version():
@@ -807,10 +689,8 @@ async def health_check():
 
 @app.post("/upload")
 async def upload_audio(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
-    """Upload audio file and start transcription."""
     task_id = str(uuid.uuid4())
 
-    # Save uploaded file
     ext = Path(file.filename).suffix.lower()
     if ext not in ['.mp3', '.wav', '.flac', '.ogg', '.m4a']:
         raise HTTPException(400, "Unsupported file format. Use mp3, wav, flac, ogg, or m4a.")
@@ -820,6 +700,8 @@ async def upload_audio(background_tasks: BackgroundTasks, file: UploadFile = Fil
         content = await file.read()
         f.write(content)
 
+    print(f"[UPLOAD] task={task_id}, file={file.filename}, size={len(content)} bytes, saved to {upload_path}")
+
     tasks[task_id] = {
         'id': task_id,
         'status': 'queued',
@@ -828,22 +710,18 @@ async def upload_audio(background_tasks: BackgroundTasks, file: UploadFile = Fil
         'created_at': datetime.utcnow().isoformat()
     }
 
-    # Start processing
     asyncio.create_task(process_audio(task_id, upload_path))
 
     return {"task_id": task_id, "status": "queued"}
 
 @app.get("/status/{task_id}")
 async def get_status(task_id: str):
-    """Get transcription status and results."""
     if task_id not in tasks:
         raise HTTPException(404, "Task not found")
     return tasks[task_id]
 
 @app.get("/download/{file_id}")
 async def download_file(file_id: str):
-    """Download generated file (wav or xml)."""
-    # Determine extension
     for ext in ['.wav', '.xml']:
         file_path = UPLOAD_DIR / f"PianoMagic_{file_id}{ext}"
         if file_path.exists():
@@ -853,9 +731,6 @@ async def download_file(file_id: str):
 
     raise HTTPException(404, "File not found")
 
-# ───────────────────────────────────────────────────────────────
-# Startup
-# ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))

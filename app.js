@@ -1,15 +1,9 @@
 /* PianoMagic Frontend — v7.2 */
 
-// ─────────────────────────────────────────────
-// Configuration
-// ─────────────────────────────────────────────
 const FE_VERSION = '7.2';
-const API_BASE = 'https://pianomagic-api.onrender.com';  // Update if needed
-// const API_BASE = 'http://localhost:8000';  // For local dev
+const API_BASE = 'https://pianomagic-api.onrender.com';
 
-// ─────────────────────────────────────────────
 // State
-// ─────────────────────────────────────────────
 let currentTaskId = null;
 let pollInterval = null;
 let notes = [];
@@ -23,10 +17,9 @@ let staffOffsetX = 0;
 let isDraggingStaff = false;
 let lastMouseX = 0;
 let currentDuration = 0;
+let scheduledNodes = [];
 
-// ─────────────────────────────────────────────
 // DOM Elements
-// ─────────────────────────────────────────────
 const dropZone = document.getElementById('dropZone');
 const fileInput = document.getElementById('fileInput');
 const uploadSection = document.getElementById('uploadSection');
@@ -64,8 +57,7 @@ function setupEventListeners() {
     dropZone.addEventListener('drop', (e) => {
         e.preventDefault();
         dropZone.classList.remove('dragover');
-        const files = e.dataTransfer.files;
-        if (files.length > 0) handleFile(files[0]);
+        if (e.dataTransfer.files.length > 0) handleFile(e.dataTransfer.files[0]);
     });
 
     // File input
@@ -76,15 +68,17 @@ function setupEventListeners() {
     // Staff controls
     document.getElementById('playBtn').addEventListener('click', togglePlay);
     document.getElementById('stopBtn').addEventListener('click', stopPlayback);
-    document.getElementById('zoomInBtn').addEventListener('click', () => setZoom(staffZoom * 1.2));
-    document.getElementById('zoomOutBtn').addEventListener('click', () => setZoom(staffZoom / 1.2));
+    document.getElementById('zoomInBtn').addEventListener('click', () => setZoom(staffZoom * 1.3));
+    document.getElementById('zoomOutBtn').addEventListener('click', () => setZoom(staffZoom / 1.3));
 
     // Seek bar
     seekBar.addEventListener('input', (e) => {
         playOffset = (e.target.value / 100) * currentDuration;
         updatePlayhead();
         if (isPlaying) {
+            stopAllSounds();
             playStartTime = audioContext.currentTime - playOffset;
+            scheduleAllNotes();
         }
     });
 
@@ -99,6 +93,7 @@ function setupEventListeners() {
         const dx = e.clientX - lastMouseX;
         staffOffsetX += dx;
         lastMouseX = e.clientX;
+        clampOffset();
         drawStaff();
     });
     window.addEventListener('mouseup', () => {
@@ -106,11 +101,63 @@ function setupEventListeners() {
         staffCanvas.style.cursor = 'grab';
     });
 
-    window.addEventListener('resize', resizeStaff);
+    // Touch support
+    staffCanvas.addEventListener('touchstart', (e) => {
+        isDraggingStaff = true;
+        lastMouseX = e.touches[0].clientX;
+    }, {passive: false});
+    window.addEventListener('touchmove', (e) => {
+        if (!isDraggingStaff) return;
+        e.preventDefault();
+        const dx = e.touches[0].clientX - lastMouseX;
+        staffOffsetX += dx;
+        lastMouseX = e.touches[0].clientX;
+        clampOffset();
+        drawStaff();
+    }, {passive: false});
+    window.addEventListener('touchend', () => {
+        isDraggingStaff = false;
+    });
+
+    window.addEventListener('resize', () => {
+        resizeStaff();
+        autoZoom();
+    });
+}
+
+function clampOffset() {
+    const wrapper = document.querySelector('.staff-wrapper');
+    const width = wrapper.clientWidth;
+    const marginLeft = 50;
+    const marginRight = 20;
+    const maxTime = Math.max(...notes.map(n => n.end), currentDuration || 1);
+    const contentWidth = marginLeft + maxTime * getPixelsPerSecond() + marginRight;
+    const minOffset = Math.min(0, width - contentWidth);
+    staffOffsetX = Math.max(minOffset, Math.min(0, staffOffsetX));
+}
+
+function getPixelsPerSecond() {
+    const wrapper = document.querySelector('.staff-wrapper');
+    const width = wrapper.clientWidth;
+    const maxTime = Math.max(...notes.map(n => n.end), currentDuration || 1);
+    return (width - 70) / maxTime * staffZoom;
+}
+
+function autoZoom() {
+    if (!notes.length || !currentDuration) return;
+    const wrapper = document.querySelector('.staff-wrapper');
+    const width = wrapper.clientWidth;
+    // Target: show ~30 seconds per screen width
+    const targetPps = width / 30;
+    const basePps = (width - 70) / currentDuration;
+    staffZoom = targetPps / basePps;
+    staffZoom = Math.max(0.5, Math.min(20, staffZoom));
+    staffOffsetX = 0;
+    drawStaff();
 }
 
 // ─────────────────────────────────────────────
-// API Status
+// API
 // ─────────────────────────────────────────────
 async function checkApiStatus() {
     const statusEl = document.getElementById('apiStatus');
@@ -133,7 +180,7 @@ async function checkApiStatus() {
 }
 
 // ─────────────────────────────────────────────
-// File Upload
+// Upload
 // ─────────────────────────────────────────────
 function handleFile(file) {
     const validTypes = ['audio/mpeg','audio/wav','audio/x-wav','audio/flac','audio/ogg','audio/mp4','audio/x-m4a'];
@@ -144,7 +191,6 @@ function handleFile(file) {
         alert('Неподдерживаемый формат. Используйте MP3, WAV, FLAC, OGG или M4A.');
         return;
     }
-
     uploadFile(file);
 }
 
@@ -174,11 +220,11 @@ async function uploadFile(file) {
 }
 
 // ─────────────────────────────────────────────
-// Progress Polling
+// Polling
 // ─────────────────────────────────────────────
 function startPolling(taskId) {
     if (pollInterval) clearInterval(pollInterval);
-    pollInterval = setInterval(() => pollStatus(taskId), 1000);
+    pollInterval = setInterval(() => pollStatus(taskId), 1500);
 }
 
 async function pollStatus(taskId) {
@@ -217,11 +263,10 @@ function getStatusText(status) {
 function highlightStage(status) {
     document.querySelectorAll('.stage').forEach(el => {
         el.classList.toggle('active', el.dataset.stage === status);
-        el.classList.toggle('done', 
-            ['synthesizing','generating_score','completed'].includes(status) && 
-            ['loading','analyzing'].includes(el.dataset.stage) ||
-            status === 'completed'
-        );
+        const doneStages = ['synthesizing','generating_score','completed'];
+        const currentDone = doneStages.includes(status);
+        const elDone = ['loading','analyzing'].includes(el.dataset.stage) && currentDone;
+        el.classList.toggle('done', elDone || status === 'completed');
     });
 }
 
@@ -238,58 +283,53 @@ function updateProgress(percent, text) {
 }
 
 // ─────────────────────────────────────────────
-// Results Display
+// Results
 // ─────────────────────────────────────────────
 function showResults(result) {
     progressSection.classList.add('hidden');
     resultsSection.classList.remove('hidden');
 
-    // Info panel
     document.getElementById('noteCount').textContent = result.notes_count || '—';
     document.getElementById('rhCount').textContent = result.rh_notes || '—';
     document.getElementById('lhCount').textContent = result.lh_notes || '—';
     document.getElementById('tempoValue').textContent = result.tempo ? `${result.tempo} BPM` : '—';
     document.getElementById('keyValue').textContent = result.key || '—';
 
-    // Notes data
     notes = result.notes || [];
     currentDuration = result.duration || 0;
     totalTimeEl.textContent = formatTime(currentDuration);
-    seekBar.max = 100;
     seekBar.value = 0;
 
-    // Setup downloads
     const wavUrl = result.wav_url ? `${API_BASE}${result.wav_url}` : '#';
     const xmlUrl = result.xml_url ? `${API_BASE}${result.xml_url}` : '#';
     document.getElementById('downloadWav').href = wavUrl;
     document.getElementById('downloadXml').href = xmlUrl;
 
-    // Setup audio player
     audioPlayer.src = wavUrl;
     audioPlayer.load();
 
-    // Draw staff
     resizeStaff();
-    drawStaff();
+    autoZoom();
 }
 
 // ─────────────────────────────────────────────
-// Staff Canvas Rendering
+// Staff Canvas
 // ─────────────────────────────────────────────
 function resizeStaff() {
     const wrapper = document.querySelector('.staff-wrapper');
     const dpr = window.devicePixelRatio || 1;
     staffCanvas.width = wrapper.clientWidth * dpr;
-    staffCanvas.height = 400 * dpr;
+    staffCanvas.height = 420 * dpr;
     staffCanvas.style.width = wrapper.clientWidth + 'px';
-    staffCanvas.style.height = '400px';
+    staffCanvas.style.height = '420px';
     const ctx = staffCanvas.getContext('2d');
     ctx.scale(dpr, dpr);
     drawStaff();
 }
 
 function setZoom(z) {
-    staffZoom = Math.max(0.1, Math.min(10, z));
+    staffZoom = Math.max(0.1, Math.min(50, z));
+    clampOffset();
     drawStaff();
 }
 
@@ -297,7 +337,6 @@ function drawStaff() {
     const ctx = staffCanvas.getContext('2d');
     const width = staffCanvas.width / (window.devicePixelRatio || 1);
     const height = staffCanvas.height / (window.devicePixelRatio || 1);
-    const dpr = window.devicePixelRatio || 1;
 
     ctx.clearRect(0, 0, width, height);
 
@@ -311,31 +350,48 @@ function drawStaff() {
 
     const marginLeft = 50;
     const marginRight = 20;
-    const staffTop = 60;
-    const staffGap = 120;
-    const lineSpacing = 8;
+    const staffTop = 70;
+    const staffGap = 130;
+    const lineSpacing = 9;
 
-    // Time scaling
     const maxTime = Math.max(...notes.map(n => n.end), currentDuration || 1);
-    const pixelsPerSecond = (width - marginLeft - marginRight) / maxTime * staffZoom;
+    const pps = getPixelsPerSecond();
 
-    // Draw time grid
-    ctx.strokeStyle = '#e0e0e0';
+    // Background
+    ctx.fillStyle = '#fffef8';
+    ctx.fillRect(0, 0, width, height);
+
+    // Time grid
+    ctx.strokeStyle = '#e8e4d8';
     ctx.lineWidth = 0.5;
-    for (let t = 0; t <= maxTime; t += 1) {
-        const x = marginLeft + t * pixelsPerSecond + staffOffsetX;
-        if (x < marginLeft || x > width - marginRight) continue;
+    for (let t = 0; t <= maxTime + 1; t += 1) {
+        const x = marginLeft + t * pps + staffOffsetX;
+        if (x < marginLeft - 5 || x > width) continue;
         ctx.beginPath();
-        ctx.moveTo(x, 20);
-        ctx.lineTo(x, height - 20);
+        ctx.moveTo(x, 10);
+        ctx.lineTo(x, height - 10);
         ctx.stroke();
-        ctx.fillStyle = '#999';
+        ctx.fillStyle = '#aaa';
         ctx.font = '10px sans-serif';
-        ctx.fillText(t + 's', x + 2, 15);
+        ctx.textAlign = 'center';
+        ctx.fillText(t + 's', x, 24);
     }
 
-    // Draw staves (5 lines each)
-    function drawFiveLines(yCenter) {
+    // Beat grid (quarter notes)
+    const beatDuration = 60.0 / (parseFloat(document.getElementById('tempoValue').textContent) || 120);
+    ctx.strokeStyle = '#f0ece0';
+    ctx.lineWidth = 0.3;
+    for (let t = 0; t <= maxTime; t += beatDuration) {
+        const x = marginLeft + t * pps + staffOffsetX;
+        if (x < marginLeft || x > width) continue;
+        ctx.beginPath();
+        ctx.moveTo(x, staffTop - 30);
+        ctx.lineTo(x, staffTop + staffGap + 50);
+        ctx.stroke();
+    }
+
+    // Draw staves
+    function drawFiveLines(yCenter, label) {
         ctx.strokeStyle = '#333';
         ctx.lineWidth = 1;
         for (let i = -2; i <= 2; i++) {
@@ -345,97 +401,104 @@ function drawStaff() {
             ctx.lineTo(width - marginRight, y);
             ctx.stroke();
         }
-        // Clef symbols
-        ctx.font = '24px serif';
+        ctx.font = '22px serif';
         ctx.fillStyle = '#333';
-        ctx.fillText('𝄞', marginLeft - 35, yCenter + 8);
+        ctx.fillText(label, marginLeft - 38, yCenter + 8);
     }
 
-    // Treble staff (RH)
-    drawFiveLines(staffTop + 2 * lineSpacing);
-    // Bass staff (LH)  
-    drawFiveLines(staffTop + staffGap + 2 * lineSpacing);
-    ctx.fillText('𝄢', marginLeft - 35, staffTop + staffGap + 2 * lineSpacing + 8);
+    drawFiveLines(staffTop + 2 * lineSpacing, '𝄞');
+    drawFiveLines(staffTop + staffGap + 2 * lineSpacing, '𝄢');
+
+    // Brace
+    ctx.strokeStyle = '#333';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(marginLeft - 8, staffTop + 2 * lineSpacing - 15);
+    ctx.quadraticCurveTo(marginLeft - 18, staffTop + staffGap/2 + 2 * lineSpacing, marginLeft - 8, staffTop + staffGap + 2 * lineSpacing + 15);
+    ctx.stroke();
 
     // Draw notes
     notes.forEach(note => {
-        const x = marginLeft + note.start * pixelsPerSecond + staffOffsetX;
-        const w = Math.max(3, (note.end - note.start) * pixelsPerSecond);
+        const x = marginLeft + note.start * pps + staffOffsetX;
+        const w = Math.max(4, (note.end - note.start) * pps);
 
-        if (x + w < marginLeft || x > width - marginRight) return;
+        if (x + w < 0 || x > width) return;
 
         const isRH = note.hand === 'RH';
         const staffY = isRH ? staffTop : staffTop + staffGap;
-        const color = isRH ? 'rgba(220, 50, 50, 0.85)' : 'rgba(50, 80, 220, 0.85)';
-        const borderColor = isRH ? '#a02020' : '#2030a0';
+        const color = isRH ? 'rgba(200, 60, 60, 0.8)' : 'rgba(50, 90, 200, 0.8)';
+        const borderColor = isRH ? '#a03030' : '#2030a0';
 
-        // MIDI to staff position (simplified)
-        // Treble: middle C (60) = line below staff
-        // Bass: middle C (60) = line above staff
         let midi = note.pitch_midi;
         let yPos;
 
         if (isRH) {
-            // Treble clef: E4 (64) = bottom line, F5 (77) = top line
-            // Each semitone = lineSpacing/2
-            const refMidi = 64; // E4, bottom line
-            const refY = staffTop + 4 * lineSpacing; // bottom line
+            const refMidi = 64;
+            const refY = staffTop + 4 * lineSpacing;
             yPos = refY - (midi - refMidi) * (lineSpacing / 2);
         } else {
-            // Bass clef: G2 (43) = bottom line, A3 (57) = top line
-            const refMidi = 43; // G2, bottom line
+            const refMidi = 43;
             const refY = staffTop + staffGap + 4 * lineSpacing;
             yPos = refY - (midi - refMidi) * (lineSpacing / 2);
         }
 
-        // Draw note body
+        const noteHeight = lineSpacing * 1.3;
+        const noteWidth = Math.max(6, w);
+
+        // Note body (rounded rect fallback)
         ctx.fillStyle = color;
         ctx.strokeStyle = borderColor;
         ctx.lineWidth = 1;
-
-        const noteHeight = lineSpacing * 1.2;
-        const noteWidth = Math.max(8, w);
-
-        ctx.beginPath();
-        ctx.roundRect(x, yPos - noteHeight/2, noteWidth, noteHeight, 3);
+        roundRect(ctx, x, yPos - noteHeight/2, noteWidth, noteHeight, 3);
         ctx.fill();
         ctx.stroke();
 
         // Note name
-        if (w > 20) {
+        if (w > 18) {
             ctx.fillStyle = '#fff';
-            ctx.font = 'bold 9px sans-serif';
+            ctx.font = 'bold 8px sans-serif';
             ctx.textAlign = 'center';
             const name = midiToNoteName(midi);
             ctx.fillText(name, x + noteWidth/2, yPos + 3);
         }
 
         // Ledger lines
-        ctx.strokeStyle = '#333';
-        ctx.lineWidth = 0.5;
+        ctx.strokeStyle = '#555';
+        ctx.lineWidth = 0.8;
         const staffBottom = staffY + 4 * lineSpacing;
         const staffTopLine = staffY - 4 * lineSpacing;
 
-        if (yPos > staffBottom) {
-            for (let ly = staffBottom + lineSpacing; ly <= yPos + noteHeight/2; ly += lineSpacing) {
+        if (yPos + noteHeight/2 > staffBottom + 2) {
+            for (let ly = staffBottom + lineSpacing; ly <= yPos + noteHeight/2 + 2; ly += lineSpacing) {
                 ctx.beginPath();
-                ctx.moveTo(x - 3, ly);
-                ctx.lineTo(x + noteWidth + 3, ly);
+                ctx.moveTo(x - 4, ly);
+                ctx.lineTo(x + noteWidth + 4, ly);
                 ctx.stroke();
             }
         }
-        if (yPos < staffTopLine) {
-            for (let ly = staffTopLine - lineSpacing; ly >= yPos - noteHeight/2; ly -= lineSpacing) {
+        if (yPos - noteHeight/2 < staffTopLine - 2) {
+            for (let ly = staffTopLine - lineSpacing; ly >= yPos - noteHeight/2 - 2; ly -= lineSpacing) {
                 ctx.beginPath();
-                ctx.moveTo(x - 3, ly);
-                ctx.lineTo(x + noteWidth + 3, ly);
+                ctx.moveTo(x - 4, ly);
+                ctx.lineTo(x + noteWidth + 4, ly);
                 ctx.stroke();
             }
         }
     });
 
-    // Update playhead position
     updatePlayhead();
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+    if (w < 2 * r) r = w / 2;
+    if (h < 2 * r) r = h / 2;
+    ctx.beginPath();
+    ctx.moveTo(x + r, y);
+    ctx.arcTo(x + w, y, x + w, y + h, r);
+    ctx.arcTo(x + w, y + h, x, y + h, r);
+    ctx.arcTo(x, y + h, x, y, r);
+    ctx.arcTo(x, y, x + w, y, r);
+    ctx.closePath();
 }
 
 function midiToNoteName(midi) {
@@ -444,26 +507,25 @@ function midiToNoteName(midi) {
 }
 
 function updatePlayhead() {
-    const width = staffCanvas.width / (window.devicePixelRatio || 1);
+    const wrapper = document.querySelector('.staff-wrapper');
+    const width = wrapper.clientWidth;
     const marginLeft = 50;
-    const marginRight = 20;
-    const maxTime = Math.max(...notes.map(n => n.end), currentDuration || 1);
-    const pixelsPerSecond = (width - marginLeft - marginRight) / maxTime * staffZoom;
+    const pps = getPixelsPerSecond();
 
-    const x = marginLeft + playOffset * pixelsPerSecond + staffOffsetX;
+    const x = marginLeft + playOffset * pps + staffOffsetX;
     playhead.style.left = x + 'px';
-
     currentTimeEl.textContent = formatTime(playOffset);
 }
 
 function formatTime(s) {
+    if (!isFinite(s) || s < 0) s = 0;
     const m = Math.floor(s / 60);
     const sec = Math.floor(s % 60);
     return `${m}:${sec.toString().padStart(2, '0')}`;
 }
 
 // ─────────────────────────────────────────────
-// Web Audio Synthesizer Playback
+// Web Audio Playback
 // ─────────────────────────────────────────────
 function getAudioContext() {
     if (!audioContext) {
@@ -480,6 +542,14 @@ function togglePlay() {
     }
 }
 
+function stopAllSounds() {
+    scheduledNodes.forEach(n => {
+        try { n.stop(); } catch(e) {}
+        try { n.disconnect(); } catch(e) {}
+    });
+    scheduledNodes = [];
+}
+
 function startPlayback() {
     if (!notes.length) return;
     const ctx = getAudioContext();
@@ -489,47 +559,51 @@ function startPlayback() {
     playStartTime = ctx.currentTime - playOffset;
     document.getElementById('playBtn').textContent = '⏸ Пауза';
 
-    // Schedule all notes
-    notes.forEach(note => {
-        if (note.start < playOffset) return; // Skip notes before current position
-        const t = note.start - playOffset;
-        scheduleNote(ctx, note, t);
-    });
-
+    scheduleAllNotes();
     animatePlayhead();
+}
+
+function scheduleAllNotes() {
+    const ctx = getAudioContext();
+    notes.forEach(note => {
+        if (note.start < playOffset) return;
+        const when = note.start - playOffset;
+        scheduleNote(ctx, note, when);
+    });
 }
 
 function scheduleNote(ctx, note, when) {
     const freq = 440 * Math.pow(2, (note.pitch_midi - 69) / 12);
     const dur = note.end - note.start;
+    if (dur <= 0) return;
 
-    // Oscillator
     const osc = ctx.createOscillator();
     osc.type = 'triangle';
     osc.frequency.value = freq;
 
-    // Gain envelope (ADSR)
     const gain = ctx.createGain();
     const panner = ctx.createStereoPanner();
     panner.pan.value = note.hand === 'RH' ? 0.6 : -0.6;
 
     const now = ctx.currentTime + when;
     gain.gain.setValueAtTime(0, now);
-    gain.gain.linearRampToValueAtTime(0.3, now + 0.01);   // Attack
-    gain.gain.linearRampToValueAtTime(0.2, now + 0.1);    // Decay
-    gain.gain.linearRampToValueAtTime(0.15, now + dur - 0.05); // Sustain
-    gain.gain.linearRampToValueAtTime(0, now + dur);      // Release
+    gain.gain.linearRampToValueAtTime(0.25, now + 0.01);
+    gain.gain.linearRampToValueAtTime(0.15, now + 0.1);
+    gain.gain.linearRampToValueAtTime(0.1, now + dur - 0.05);
+    gain.gain.linearRampToValueAtTime(0, now + dur);
 
     osc.connect(gain);
     gain.connect(panner);
     panner.connect(ctx.destination);
 
     osc.start(now);
-    osc.stop(now + dur + 0.1);
+    osc.stop(now + dur + 0.05);
+    scheduledNodes.push(osc);
 }
 
 function pausePlayback() {
     isPlaying = false;
+    stopAllSounds();
     document.getElementById('playBtn').textContent = '▶️ Играть';
     if (animationFrame) cancelAnimationFrame(animationFrame);
     playOffset = audioContext.currentTime - playStartTime;
@@ -537,6 +611,7 @@ function pausePlayback() {
 
 function stopPlayback() {
     isPlaying = false;
+    stopAllSounds();
     playOffset = 0;
     document.getElementById('playBtn').textContent = '▶️ Играть';
     if (animationFrame) cancelAnimationFrame(animationFrame);
@@ -555,7 +630,7 @@ function animatePlayhead() {
     }
 
     updatePlayhead();
-    seekBar.value = (playOffset / currentDuration) * 100;
+    seekBar.value = Math.min(100, (playOffset / currentDuration) * 100);
 
     animationFrame = requestAnimationFrame(animatePlayhead);
 }
