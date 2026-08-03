@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PianoMagic v7.2 — Тест гипотезы continuous pitch contour segmentation
+PianoMagic v7.2.1 — Тест гипотезы continuous pitch contour segmentation
 Запуск: python test_v72_hypothesis.py kuznechik.mp3
 """
 import sys
@@ -12,14 +12,14 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 def test_v72_hypothesis(audio_path):
-    print(f"[v7.2 Test] Загрузка {audio_path}...")
+    print(f"[v7.2.1 Test] Загрузка {audio_path}...")
     y, sr = librosa.load(audio_path, sr=22050, mono=True)
     duration = librosa.get_duration(y=y, sr=sr)
     print(f"  Длительность: {duration:.2f}s, SR: {sr}")
 
     # 1. PYIN с мелким hop для высокого разрешения
     hop_length = 256
-    print(f"[v7.2 Test] PYIN с hop={hop_length}...")
+    print(f"[v7.2.1 Test] PYIN с hop={hop_length}...")
     f0, voiced_flag, voiced_probs = librosa.pyin(
         y, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'),
         sr=sr, hop_length=hop_length, frame_length=2048
@@ -134,11 +134,11 @@ def test_v72_hypothesis(audio_path):
                 })
         return notes
 
-    print("[v7.2 Test] Сегментация верхнего голоса...")
+    print("[v7.2.1 Test] Сегментация верхнего голоса...")
     notes_high = segment_voice(vh_filled, times, min_dur_ms=60, pause_thresh_ms=100)
     print(f"  Нот верхнего голоса: {len(notes_high)}")
 
-    print("[v7.2 Test] Сегментация нижнего голоса...")
+    print("[v7.2.1 Test] Сегментация нижнего голоса...")
     notes_low = segment_voice(vl_filled, times, min_dur_ms=60, pause_thresh_ms=100)
     print(f"  Нот нижнего голоса: {len(notes_low)}")
 
@@ -184,10 +184,10 @@ def test_v72_hypothesis(audio_path):
     plt.tight_layout()
     out_path = Path(audio_path).stem + '_v72_analysis.png'
     plt.savefig(out_path, dpi=150)
-    print(f"[v7.2 Test] График сохранён: {out_path}")
+    print(f"[v7.2.1 Test] График сохранён: {out_path}")
 
     # 6. Статистика
-    print("\n=== СТАТИСТИКА v7.2 ===")
+    print("\n=== СТАТИСТИКА v7.2.1 ===")
     print(f"Верхний голос (RH): {len(notes_high)} нот")
     if notes_high:
         pitches_h = [n['pitch_midi'] for n in notes_high]

@@ -1,6 +1,6 @@
-/* PianoMagic Frontend — v7.2 */
+/* PianoMagic Frontend — v7.2.1 */
 
-const FE_VERSION = '7.2';
+const FE_VERSION = '7.2.1';
 const API_BASE = 'https://pianomagic-api.onrender.com';
 
 // State
@@ -46,7 +46,6 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 function setupEventListeners() {
-    // Drag & Drop
     dropZone.addEventListener('dragover', (e) => {
         e.preventDefault();
         dropZone.classList.add('dragover');
@@ -60,18 +59,15 @@ function setupEventListeners() {
         if (e.dataTransfer.files.length > 0) handleFile(e.dataTransfer.files[0]);
     });
 
-    // File input
     fileInput.addEventListener('change', (e) => {
         if (e.target.files.length > 0) handleFile(e.target.files[0]);
     });
 
-    // Staff controls
     document.getElementById('playBtn').addEventListener('click', togglePlay);
     document.getElementById('stopBtn').addEventListener('click', stopPlayback);
     document.getElementById('zoomInBtn').addEventListener('click', () => setZoom(staffZoom * 1.3));
     document.getElementById('zoomOutBtn').addEventListener('click', () => setZoom(staffZoom / 1.3));
 
-    // Seek bar
     seekBar.addEventListener('input', (e) => {
         playOffset = (e.target.value / 100) * currentDuration;
         updatePlayhead();
@@ -82,7 +78,6 @@ function setupEventListeners() {
         }
     });
 
-    // Staff drag
     staffCanvas.addEventListener('mousedown', (e) => {
         isDraggingStaff = true;
         lastMouseX = e.clientX;
@@ -101,7 +96,6 @@ function setupEventListeners() {
         staffCanvas.style.cursor = 'grab';
     });
 
-    // Touch support
     staffCanvas.addEventListener('touchstart', (e) => {
         isDraggingStaff = true;
         lastMouseX = e.touches[0].clientX;
@@ -147,7 +141,6 @@ function autoZoom() {
     if (!notes.length || !currentDuration) return;
     const wrapper = document.querySelector('.staff-wrapper');
     const width = wrapper.clientWidth;
-    // Target: show ~30 seconds per screen width
     const targetPps = width / 30;
     const basePps = (width - 70) / currentDuration;
     staffZoom = targetPps / basePps;
@@ -295,6 +288,19 @@ function showResults(result) {
     document.getElementById('tempoValue').textContent = result.tempo ? `${result.tempo} BPM` : '—';
     document.getElementById('keyValue').textContent = result.key || '—';
 
+    // Comparison metrics
+    const comp = result.comparison || {};
+    document.getElementById('chromaCorr').textContent = comp.chroma_correlation !== undefined ? comp.chroma_correlation.toFixed(3) : '—';
+    document.getElementById('spectralCorr').textContent = comp.spectral_contrast_correlation !== undefined ? comp.spectral_contrast_correlation.toFixed(3) : '—';
+    document.getElementById('onsetCorr').textContent = comp.onset_correlation !== undefined ? comp.onset_correlation.toFixed(3) : '—';
+    document.getElementById('overallCorr').textContent = comp.overall_similarity !== undefined ? comp.overall_similarity.toFixed(3) : '—';
+
+    // Chroma charts
+    if (comp.chroma_orig && comp.chroma_synth) {
+        drawChromaChart('chromaOrigCanvas', comp.chroma_orig, '#4a90d9');
+        drawChromaChart('chromaSynthCanvas', comp.chroma_synth, '#e74c3c');
+    }
+
     notes = result.notes || [];
     currentDuration = result.duration || 0;
     totalTimeEl.textContent = formatTime(currentDuration);
@@ -310,6 +316,36 @@ function showResults(result) {
 
     resizeStaff();
     autoZoom();
+}
+
+function drawChromaChart(canvasId, data, color) {
+    const canvas = document.getElementById(canvasId);
+    if (!canvas || !data || data.length !== 12) return;
+    const ctx = canvas.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    const w = canvas.width / dpr;
+    const h = canvas.height / dpr;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.scale(dpr, dpr);
+
+    const labels = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+    const maxVal = Math.max(...data, 0.001);
+    const barW = (w - 40) / 12;
+    const barMaxH = h - 30;
+
+    data.forEach((val, i) => {
+        const barH = (val / maxVal) * barMaxH;
+        const x = 20 + i * barW;
+        const y = h - 20 - barH;
+        ctx.fillStyle = color;
+        ctx.globalAlpha = 0.8;
+        ctx.fillRect(x + 2, y, barW - 4, barH);
+        ctx.globalAlpha = 1;
+        ctx.fillStyle = '#555';
+        ctx.font = '10px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText(labels[i], x + barW/2, h - 5);
+    });
 }
 
 // ─────────────────────────────────────────────
@@ -357,11 +393,9 @@ function drawStaff() {
     const maxTime = Math.max(...notes.map(n => n.end), currentDuration || 1);
     const pps = getPixelsPerSecond();
 
-    // Background
     ctx.fillStyle = '#fffef8';
     ctx.fillRect(0, 0, width, height);
 
-    // Time grid
     ctx.strokeStyle = '#e8e4d8';
     ctx.lineWidth = 0.5;
     for (let t = 0; t <= maxTime + 1; t += 1) {
@@ -377,7 +411,6 @@ function drawStaff() {
         ctx.fillText(t + 's', x, 24);
     }
 
-    // Beat grid (quarter notes)
     const beatDuration = 60.0 / (parseFloat(document.getElementById('tempoValue').textContent) || 120);
     ctx.strokeStyle = '#f0ece0';
     ctx.lineWidth = 0.3;
@@ -390,7 +423,6 @@ function drawStaff() {
         ctx.stroke();
     }
 
-    // Draw staves
     function drawFiveLines(yCenter, label) {
         ctx.strokeStyle = '#333';
         ctx.lineWidth = 1;
@@ -409,7 +441,6 @@ function drawStaff() {
     drawFiveLines(staffTop + 2 * lineSpacing, '𝄞');
     drawFiveLines(staffTop + staffGap + 2 * lineSpacing, '𝄢');
 
-    // Brace
     ctx.strokeStyle = '#333';
     ctx.lineWidth = 1.5;
     ctx.beginPath();
@@ -417,7 +448,6 @@ function drawStaff() {
     ctx.quadraticCurveTo(marginLeft - 18, staffTop + staffGap/2 + 2 * lineSpacing, marginLeft - 8, staffTop + staffGap + 2 * lineSpacing + 15);
     ctx.stroke();
 
-    // Draw notes
     notes.forEach(note => {
         const x = marginLeft + note.start * pps + staffOffsetX;
         const w = Math.max(4, (note.end - note.start) * pps);
@@ -445,7 +475,6 @@ function drawStaff() {
         const noteHeight = lineSpacing * 1.3;
         const noteWidth = Math.max(6, w);
 
-        // Note body (rounded rect fallback)
         ctx.fillStyle = color;
         ctx.strokeStyle = borderColor;
         ctx.lineWidth = 1;
@@ -453,7 +482,6 @@ function drawStaff() {
         ctx.fill();
         ctx.stroke();
 
-        // Note name
         if (w > 18) {
             ctx.fillStyle = '#fff';
             ctx.font = 'bold 8px sans-serif';
@@ -462,7 +490,6 @@ function drawStaff() {
             ctx.fillText(name, x + noteWidth/2, yPos + 3);
         }
 
-        // Ledger lines
         ctx.strokeStyle = '#555';
         ctx.lineWidth = 0.8;
         const staffBottom = staffY + 4 * lineSpacing;

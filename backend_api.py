@@ -1,23 +1,22 @@
 """
-PianoMagic Backend API — v7.2
-Audio-to-piano-score transcription with continuous pitch contour segmentation
+PianoMagic Backend API — v7.2.1
+Audio-to-piano-score transcription
 """
 
 import os
-import io
 import uuid
 import asyncio
 import tempfile
 import traceback
 from pathlib import Path
-from typing import Optional, List, Dict
+from typing import List, Dict
 from dataclasses import dataclass, field
 from datetime import datetime
 
 import numpy as np
 import librosa
-from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from xml.etree.ElementTree import Element, SubElement, tostring
@@ -29,7 +28,7 @@ from scipy.ndimage import median_filter
 # ───────────────────────────────────────────────────────────────
 # Configuration
 # ───────────────────────────────────────────────────────────────
-VERSION = "7.2.0"
+VERSION = "7.2.1"
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "pianomagic_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 print(f"[INIT] UPLOAD_DIR={UPLOAD_DIR}, exists={UPLOAD_DIR.exists()}")
@@ -75,11 +74,6 @@ class TranscriptionResult:
 # ───────────────────────────────────────────────────────────────
 # Utility Functions
 # ───────────────────────────────────────────────────────────────
-def midi_to_note_name(midi: int) -> str:
-    names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
-    octave = (midi // 12) - 1
-    return f"{names[midi % 12]}{octave}"
-
 def midi_to_ly_step(midi: int) -> tuple:
     names = ['C', 'C', 'D', 'D', 'E', 'F', 'F', 'G', 'G', 'A', 'A', 'B']
     alters = [0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0]
@@ -106,22 +100,21 @@ def estimate_key(chroma: np.ndarray) -> str:
     return max(correlations, key=correlations.get)
 
 # ───────────────────────────────────────────────────────────────
-# Core Algorithm: v7.2
+# Core Algorithm: v7.2.1
 # ───────────────────────────────────────────────────────────────
-def smooth_pitch(voice: np.ndarray, window: int = 5) -> np.ndarray:
-    """Apply median filter to smooth pitch contour."""
+def smooth_pitch(voice: np.ndarray, window: int = 7) -> np.ndarray:
+    """Median filter to remove vibrato artifacts."""
     valid = ~np.isnan(voice)
     if np.sum(valid) < window:
         return voice
     result = voice.copy()
-    # Only smooth valid regions
     valid_indices = np.where(valid)[0]
     if len(valid_indices) >= window:
         smoothed = median_filter(voice[valid_indices], size=window, mode='nearest')
         result[valid_indices] = smoothed
     return result
 
-def fill_short_gaps(voice: np.ndarray, times: np.ndarray, max_gap_ms: float = 80) -> np.ndarray:
+def fill_short_gaps(voice: np.ndarray, times: np.ndarray, max_gap_ms: float = 100) -> np.ndarray:
     result = voice.copy()
     valid = ~np.isnan(voice)
     if np.sum(valid) < 2:
@@ -132,7 +125,7 @@ def fill_short_gaps(voice: np.ndarray, times: np.ndarray, max_gap_ms: float = 80
     gap_ends = np.where(gaps == 1)[0]
 
     sr = 22050
-    hop_length = 256
+    hop_length = 512
     for gs, ge in zip(gap_starts, gap_ends):
         if ge <= gs:
             continue
@@ -145,13 +138,12 @@ def segment_pitch_contour(
     filled_voice: np.ndarray,
     times: np.ndarray,
     hand: str,
-    min_dur_ms: float = 80,
-    pause_thresh_ms: float = 200,
-    pitch_jump_st: float = 1.0
+    min_dur_ms: float = 120,
+    pause_thresh_ms: float = 250,
+    pitch_jump_st: float = 1.5
 ) -> List[Note]:
     """
-    Segment pitch contour into notes.
-    v7.2 fix: increased thresholds to avoid note fragmentation.
+    v7.2.1: More relaxed thresholds to avoid fragmentation.
     """
     notes = []
     in_note = False
@@ -210,7 +202,7 @@ def segment_pitch_contour(
 
     return notes
 
-def merge_close_notes(notes: List[Note], max_gap_ms: float = 100, max_pitch_diff_st: float = 1.0) -> List[Note]:
+def merge_close_notes(notes: List[Note], max_gap_ms: float = 150, max_pitch_diff_st: float = 1.5) -> List[Note]:
     if not notes:
         return notes
     notes_sorted = sorted(notes, key=lambda n: n.start)
@@ -221,10 +213,23 @@ def merge_close_notes(notes: List[Note], max_gap_ms: float = 100, max_pitch_diff
         pitch_diff = abs(note.pitch_midi - last.pitch_midi)
         if gap_ms < max_gap_ms and pitch_diff <= max_pitch_diff_st and last.hand == note.hand:
             last.end = note.end
-            last.pitch_midi = int(round((last.pitch_midi + note.pitch_midi) / 2))
+            # Keep the longer note's pitch (more stable)
+            last_dur = last.end - last.start
+            new_dur = note.end - note.start
+            if new_dur > last_dur:
+                last.pitch_midi = note.pitch_midi
         else:
             merged.append(note)
     return merged
+
+def quantize_notes(notes: List[Note], time_grid_ms: float = 50) -> List[Note]:
+    """Quantize note boundaries to reduce micro-timing jitter."""
+    for n in notes:
+        n.start = round(n.start * 1000 / time_grid_ms) * time_grid_ms / 1000
+        n.end = round(n.end * 1000 / time_grid_ms) * time_grid_ms / 1000
+        if n.end <= n.start:
+            n.end = n.start + 0.12  # minimum 120ms
+    return notes
 
 def extract_melody_librosa_v72(y: np.ndarray, sr: int) -> TranscriptionResult:
     duration = librosa.get_duration(y=y, sr=sr)
@@ -232,8 +237,8 @@ def extract_melody_librosa_v72(y: np.ndarray, sr: int) -> TranscriptionResult:
         print(f"[EXTRACT WARN] Audio too short: {len(y)} samples")
         return TranscriptionResult(notes=[], tempo=120.0, key="C major", duration=duration, sr=sr)
 
-    # 1. PYIN with fine hop resolution
-    hop_length = 256
+    # 1. PYIN with moderate hop (balance between resolution and noise)
+    hop_length = 512
     print(f"[EXTRACT] Running PYIN, hop={hop_length}...")
     f0, voiced_flag, voiced_probs = librosa.pyin(
         y,
@@ -246,11 +251,12 @@ def extract_melody_librosa_v72(y: np.ndarray, sr: int) -> TranscriptionResult:
     times = librosa.frames_to_time(np.arange(len(f0)), sr=sr, hop_length=hop_length)
     print(f"[EXTRACT] PYIN done: {np.sum(voiced_flag)} voiced frames out of {len(f0)}")
 
-    # 2. Adaptive voice separation
+    # 2. Adaptive voice separation using median split
     valid_f0 = f0[voiced_flag]
     if len(valid_f0) >= 2:
         median_f0 = np.median(valid_f0)
-        threshold = median_f0 * 0.7
+        # Use 0.6x median as threshold (slightly lower to catch more melody)
+        threshold = median_f0 * 0.6
         print(f"[EXTRACT] Adaptive threshold: {threshold:.1f} Hz (median={median_f0:.1f})")
         high_mask = (f0 > threshold) & voiced_flag
         low_mask = (f0 <= threshold) & voiced_flag
@@ -263,28 +269,32 @@ def extract_melody_librosa_v72(y: np.ndarray, sr: int) -> TranscriptionResult:
     print(f"[EXTRACT] High voice frames: {np.sum(high_mask)}, Low: {np.sum(low_mask)}")
 
     # 3. Fill short gaps
-    vh_filled = fill_short_gaps(voice_high, times, max_gap_ms=80)
-    vl_filled = fill_short_gaps(voice_low, times, max_gap_ms=80)
+    vh_filled = fill_short_gaps(voice_high, times, max_gap_ms=100)
+    vl_filled = fill_short_gaps(voice_low, times, max_gap_ms=100)
 
-    # 4. Smooth pitch contours (NEW: reduce vibrato artifacts)
-    vh_smooth = smooth_pitch(vh_filled, window=5)
-    vl_smooth = smooth_pitch(vl_filled, window=5)
+    # 4. Smooth pitch contours (remove vibrato)
+    vh_smooth = smooth_pitch(vh_filled, window=7)
+    vl_smooth = smooth_pitch(vl_filled, window=7)
 
-    # 5. Segment with relaxed thresholds (v7.2 fix)
+    # 5. Segment with relaxed thresholds
     print("[EXTRACT] Segmenting voices...")
-    notes_high = segment_pitch_contour(vh_smooth, times, hand="RH", min_dur_ms=80, pause_thresh_ms=200, pitch_jump_st=1.0)
-    notes_low = segment_pitch_contour(vl_smooth, times, hand="LH", min_dur_ms=80, pause_thresh_ms=200, pitch_jump_st=1.0)
+    notes_high = segment_pitch_contour(vh_smooth, times, hand="RH", min_dur_ms=120, pause_thresh_ms=250, pitch_jump_st=1.5)
+    notes_low = segment_pitch_contour(vl_smooth, times, hand="LH", min_dur_ms=120, pause_thresh_ms=250, pitch_jump_st=1.5)
     print(f"[EXTRACT] Raw segments: RH={len(notes_high)}, LH={len(notes_low)}")
 
-    # 6. Merge close notes
-    notes_high = merge_close_notes(notes_high, max_gap_ms=100, max_pitch_diff_st=1.0)
-    notes_low = merge_close_notes(notes_low, max_gap_ms=100, max_pitch_diff_st=1.0)
+    # 6. Merge close notes (aggressive)
+    notes_high = merge_close_notes(notes_high, max_gap_ms=150, max_pitch_diff_st=1.5)
+    notes_low = merge_close_notes(notes_low, max_gap_ms=150, max_pitch_diff_st=1.5)
     print(f"[EXTRACT] After merge: RH={len(notes_high)}, LH={len(notes_low)}")
 
-    # 7. Combine and sort
+    # 7. Quantize timing
+    notes_high = quantize_notes(notes_high)
+    notes_low = quantize_notes(notes_low)
+
+    # 8. Combine and sort
     all_notes = sorted(notes_high + notes_low, key=lambda n: n.start)
 
-    # 8. Estimate tempo and key
+    # 9. Estimate tempo and key
     tempo = 120.0
     try:
         onset_env = librosa.onset.onset_strength(y=y, sr=sr)
@@ -330,10 +340,9 @@ def synthesize_piano_v72(notes: List[Note], sr: int = 22050, duration: float = N
 
     total_samples = int(duration * sr)
     if total_samples <= 0:
-        print(f"[SYNTH WARN] total_samples={total_samples}, forcing fallback")
         return np.zeros((int(0.5 * sr), 2), dtype=np.float32)
 
-    print(f"[SYNTH] duration={duration:.3f}s, total_samples={total_samples}, input_notes={len(notes)}")
+    print(f"[SYNTH] duration={duration:.3f}s, samples={total_samples}, notes={len(notes)}")
     audio = np.zeros((total_samples, 2), dtype=np.float64)
 
     valid_notes = []
@@ -347,6 +356,10 @@ def synthesize_piano_v72(notes: List[Note], sr: int = 22050, duration: float = N
         valid_notes.append(note)
 
     print(f"[SYNTH] valid_notes={len(valid_notes)}")
+
+    if not valid_notes:
+        print("[SYNTH] No valid notes, returning silence")
+        return np.zeros((total_samples, 2), dtype=np.float32)
 
     B = 0.0003
     harmonic_amps = [1.0, 0.5, 0.25, 0.125, 0.06, 0.03, 0.015]
@@ -543,12 +556,19 @@ def generate_musicxml_v72(result: TranscriptionResult, title: str = "PianoMagic 
     return reparsed.toprettyxml(indent='  ')
 
 # ───────────────────────────────────────────────────────────────
-# Comparison
+# Comparison (with chroma data for frontend display)
 # ───────────────────────────────────────────────────────────────
 def compare_audio_features(original_y: np.ndarray, synth_y: np.ndarray, sr: int) -> dict:
     min_len = min(len(original_y), len(synth_y))
     if min_len < 512:
-        return {'chroma_correlation': 0.0, 'spectral_contrast_correlation': 0.0, 'onset_correlation': 0.0, 'overall_similarity': 0.0}
+        return {
+            'chroma_correlation': 0.0,
+            'spectral_contrast_correlation': 0.0,
+            'onset_correlation': 0.0,
+            'overall_similarity': 0.0,
+            'chroma_orig': [],
+            'chroma_synth': []
+        }
     orig = original_y[:min_len]
     synth = synth_y[:min_len]
 
@@ -571,10 +591,19 @@ def compare_audio_features(original_y: np.ndarray, synth_y: np.ndarray, sr: int)
             'chroma_correlation': round(float(chroma_corr), 3),
             'spectral_contrast_correlation': round(float(sc_corr), 3),
             'onset_correlation': round(float(onset_corr), 3),
-            'overall_similarity': round(float(overall), 3)
+            'overall_similarity': round(float(overall), 3),
+            'chroma_orig': chroma_orig.mean(axis=1).tolist(),
+            'chroma_synth': chroma_synth.mean(axis=1).tolist()
         }
     except Exception:
-        return {'chroma_correlation': 0.0, 'spectral_contrast_correlation': 0.0, 'onset_correlation': 0.0, 'overall_similarity': 0.0}
+        return {
+            'chroma_correlation': 0.0,
+            'spectral_contrast_correlation': 0.0,
+            'onset_correlation': 0.0,
+            'overall_similarity': 0.0,
+            'chroma_orig': [],
+            'chroma_synth': []
+        }
 
 # ───────────────────────────────────────────────────────────────
 # Background Task
@@ -601,12 +630,7 @@ async def process_audio(task_id: str, file_path: Path):
         synth_dur = result.duration if np.isfinite(result.duration) and result.duration > 0 else duration
         print(f"[TASK {task_id}] Synthesizing, dur={synth_dur:.3f}s")
 
-        if len(result.notes) == 0:
-            print(f"[TASK {task_id}] WARN: No notes, creating silence")
-            synth_audio = np.zeros((int(max(synth_dur, 1.0) * sr), 2), dtype=np.float32)
-        else:
-            synth_audio = synthesize_piano_v72(result.notes, sr=sr, duration=synth_dur)
-
+        synth_audio = synthesize_piano_v72(result.notes, sr=sr, duration=synth_dur)
         print(f"[TASK {task_id}] Synthesis done, shape={synth_audio.shape}, max={np.max(np.abs(synth_audio)):.4f}")
 
         tasks[task_id]['status'] = 'generating_score'
@@ -622,19 +646,21 @@ async def process_audio(task_id: str, file_path: Path):
 
         print(f"[TASK {task_id}] Saving WAV to {wav_path}")
         sf.write(str(wav_path), synth_audio, sr)
-        print(f"[TASK {task_id}] WAV saved, size={wav_path.stat().st_size} bytes")
+        wav_size = wav_path.stat().st_size if wav_path.exists() else 0
+        print(f"[TASK {task_id}] WAV saved, size={wav_size} bytes")
 
         print(f"[TASK {task_id}] Saving XML to {xml_path}")
         with open(xml_path, 'w', encoding='utf-8') as f:
             f.write(musicxml)
-        print(f"[TASK {task_id}] XML saved, size={xml_path.stat().st_size} bytes")
+        xml_size = xml_path.stat().st_size if xml_path.exists() else 0
+        print(f"[TASK {task_id}] XML saved, size={xml_size} bytes")
 
         # Compare
         try:
             comparison = compare_audio_features(y, synth_audio[:, 0] if synth_audio.ndim > 1 else synth_audio, sr)
         except Exception as e:
             print(f"[TASK {task_id}] Compare error: {e}")
-            comparison = {'chroma_correlation': 0.0, 'spectral_contrast_correlation': 0.0, 'onset_correlation': 0.0, 'overall_similarity': 0.0}
+            comparison = {'chroma_correlation': 0.0, 'spectral_contrast_correlation': 0.0, 'onset_correlation': 0.0, 'overall_similarity': 0.0, 'chroma_orig': [], 'chroma_synth': []}
 
         # Serialize notes
         notes_json = []
@@ -688,19 +714,19 @@ async def health_check():
     return {"status": "healthy", "version": VERSION}
 
 @app.post("/upload")
-async def upload_audio(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+async def upload_audio(file: UploadFile = File(...)):
     task_id = str(uuid.uuid4())
 
     ext = Path(file.filename).suffix.lower()
     if ext not in ['.mp3', '.wav', '.flac', '.ogg', '.m4a']:
-        raise HTTPException(400, "Unsupported file format. Use mp3, wav, flac, ogg, or m4a.")
+        raise HTTPException(400, "Unsupported file format.")
 
     upload_path = UPLOAD_DIR / f"{task_id}{ext}"
     with open(upload_path, 'wb') as f:
         content = await file.read()
         f.write(content)
 
-    print(f"[UPLOAD] task={task_id}, file={file.filename}, size={len(content)} bytes, saved to {upload_path}")
+    print(f"[UPLOAD] task={task_id}, file={file.filename}, size={len(content)} bytes")
 
     tasks[task_id] = {
         'id': task_id,
