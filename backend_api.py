@@ -1,5 +1,5 @@
 """
-PianoMagic Backend API — v7.4.2
+PianoMagic Backend API — v7.4.3
 Audio-to-piano-score transcription
 """
 
@@ -28,7 +28,7 @@ from scipy.ndimage import median_filter
 # ───────────────────────────────────────────────────────────────
 # Configuration
 # ───────────────────────────────────────────────────────────────
-VERSION = "7.4.2"
+VERSION = "7.4.3"
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "pianomagic_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 print(f"[INIT] UPLOAD_DIR={UPLOAD_DIR}, exists={UPLOAD_DIR.exists()}")
@@ -100,7 +100,7 @@ def estimate_key(chroma: np.ndarray) -> str:
     return max(correlations, key=correlations.get)
 
 # ───────────────────────────────────────────────────────────────
-# Core Algorithm: v7.4.2
+# Core Algorithm: v7.4.3
 # ───────────────────────────────────────────────────────────────
 def smooth_pitch(voice: np.ndarray, window: int = 7) -> np.ndarray:
     """Median filter to remove vibrato artifacts."""
@@ -277,6 +277,73 @@ def _track_voice_pyin(y: np.ndarray, sr: int, hop_length: int, fmin_note: str, f
           f"after prob>={prob_thresh} gate={int(np.sum(mask))}")
     return voice, times, int(np.sum(mask))
 
+def _estimate_hand_split(y: np.ndarray, sr: int, hop_length: int) -> int:
+    """
+    v7.4.3: the RH/LH register boundary was hardcoded at middle C (C4).
+    That silently assumes the source is a two-handed piano performance
+    with melody in the treble and accompaniment in the bass. Real-world
+    test audio (a single melody instrument/vocal recording, not a piano
+    performance) broke that assumption: its actual tune sits mostly
+    *below* C4, so the fixed C3-C6 "RH" pass only ever caught sparse
+    fragments of it, while the real line got picked up by the "LH"
+    pass and mislabeled as bass accompaniment. Confirmed by analyzing
+    a real test file: ~69% of its confidently-voiced pitch content
+    fell below C4, and the resulting RH staff was empty rests for most
+    of the piece while LH carried what was clearly the tune.
+
+    Fix: run one broadband PYIN pass first to see where THIS track's
+    pitched content actually sits, then find a natural boundary between
+    its two dominant registers via a simple 1D 2-means split (in MIDI/
+    semitone space) instead of assuming C4 always separates them. Falls
+    back to a fixed C4 if there isn't enough confidently-voiced content
+    to cluster (e.g. very short or very quiet input).
+    """
+    fallback_midi = 60  # C4
+    try:
+        f0, voiced_flag, voiced_probs = librosa.pyin(
+            y,
+            fmin=librosa.note_to_hz('C2'),
+            fmax=librosa.note_to_hz('C7'),
+            sr=sr,
+            hop_length=hop_length,
+            frame_length=2048
+        )
+        mask = voiced_flag & (voiced_probs >= 0.1)
+        hz = f0[mask]
+        hz = hz[~np.isnan(hz)]
+        if len(hz) < 40:
+            print(f"[EXTRACT] Split estimation: only {len(hz)} confident frames, falling back to fixed C4 split")
+            return fallback_midi
+
+        midi_vals = librosa.hz_to_midi(hz)
+
+        # Simple 1D 2-means - a handful of iterations is plenty for 1D data.
+        c1, c2 = np.percentile(midi_vals, 25), np.percentile(midi_vals, 75)
+        for _ in range(25):
+            d1 = np.abs(midi_vals - c1)
+            d2 = np.abs(midi_vals - c2)
+            group1 = midi_vals[d1 <= d2]
+            group2 = midi_vals[d1 > d2]
+            if len(group1) == 0 or len(group2) == 0:
+                break
+            new_c1, new_c2 = group1.mean(), group2.mean()
+            converged = abs(new_c1 - c1) < 0.01 and abs(new_c2 - c2) < 0.01
+            c1, c2 = new_c1, new_c2
+            if converged:
+                break
+
+        lo, hi = sorted([c1, c2])
+        split_midi = int(round((lo + hi) / 2))
+        # Clamp so one unusual track can't push the boundary somewhere
+        # absurd (e.g. so far up/down that one hand ends up empty anyway).
+        split_midi = max(48, min(72, split_midi))  # clamp to C3..C6
+        print(f"[EXTRACT] Adaptive hand-split: cluster centers ~{lo:.1f}/{hi:.1f} MIDI -> "
+              f"split at MIDI {split_midi} (vs fixed-C4/MIDI60 fallback)")
+        return split_midi
+    except Exception as e:
+        print(f"[EXTRACT WARN] Split estimation failed ({e}), falling back to fixed C4 split")
+        return fallback_midi
+
 def extract_melody_librosa_v73(y: np.ndarray, sr: int) -> TranscriptionResult:
     duration = librosa.get_duration(y=y, sr=sr)
     if len(y) < 2048:
@@ -285,17 +352,25 @@ def extract_melody_librosa_v73(y: np.ndarray, sr: int) -> TranscriptionResult:
 
     hop_length = 512
 
+    # 0. Figure out where THIS track's melody/bass boundary actually is
+    # (see _estimate_hand_split) instead of assuming it's always C4.
+    print("[EXTRACT] Estimating adaptive RH/LH register split...")
+    split_midi = _estimate_hand_split(y, sr, hop_length)
+    # Small overlap around the split (+/-4 semitones) is intentional: real
+    # melodies dip below the boundary and real bass/accompaniment lines
+    # can rise above it.
+    rh_low_note = librosa.midi_to_note(max(21, split_midi - 4), unicode=False)
+    lh_high_note = librosa.midi_to_note(min(96, split_midi + 4), unicode=False)
+
     # 1-2. Two independent, register-restricted PYIN passes (RH melody
     # register / LH bass register) instead of one wideband pass split by
-    # a raw Hz threshold. A small overlap around middle C (C3-C6 vs
-    # A0-C4) is intentional: real melodies dip below middle C and real
-    # bass/accompaniment lines can rise above it.
-    print("[EXTRACT] Running PYIN for RH (melody) register C3-C6...")
-    voice_high, times, n_high = _track_voice_pyin(y, sr, hop_length, 'C3', 'C6')
+    # a raw Hz threshold.
+    print(f"[EXTRACT] Running PYIN for RH (melody) register {rh_low_note}-C6...")
+    voice_high, times, n_high = _track_voice_pyin(y, sr, hop_length, rh_low_note, 'C6')
     print(f"[EXTRACT] RH voiced+confident frames: {n_high}")
 
-    print("[EXTRACT] Running PYIN for LH (bass) register A0-C4...")
-    voice_low, _, n_low = _track_voice_pyin(y, sr, hop_length, 'A0', 'C4')
+    print(f"[EXTRACT] Running PYIN for LH (bass) register A0-{lh_high_note}...")
+    voice_low, _, n_low = _track_voice_pyin(y, sr, hop_length, 'A0', lh_high_note)
     print(f"[EXTRACT] LH voiced+confident frames: {n_low}")
 
     # 3. Fill short gaps
