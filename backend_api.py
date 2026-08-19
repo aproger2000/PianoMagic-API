@@ -1,5 +1,5 @@
 """
-PianoMagic Backend API — v7.4.0
+PianoMagic Backend API — v7.4.1
 Audio-to-piano-score transcription
 """
 
@@ -28,7 +28,7 @@ from scipy.ndimage import median_filter
 # ───────────────────────────────────────────────────────────────
 # Configuration
 # ───────────────────────────────────────────────────────────────
-VERSION = "7.4.0"
+VERSION = "7.4.1"
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "pianomagic_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 print(f"[INIT] UPLOAD_DIR={UPLOAD_DIR}, exists={UPLOAD_DIR.exists()}")
@@ -100,7 +100,7 @@ def estimate_key(chroma: np.ndarray) -> str:
     return max(correlations, key=correlations.get)
 
 # ───────────────────────────────────────────────────────────────
-# Core Algorithm: v7.4.0
+# Core Algorithm: v7.4.1
 # ───────────────────────────────────────────────────────────────
 def smooth_pitch(voice: np.ndarray, window: int = 7) -> np.ndarray:
     """Median filter to remove vibrato artifacts."""
@@ -784,12 +784,24 @@ async def get_status(task_id: str):
 
 @app.get("/download/{file_id}")
 async def download_file(file_id: str):
-    for ext in ['.wav', '.xml']:
-        file_path = UPLOAD_DIR / f"PianoMagic_{file_id}{ext}"
+    # The frontend requests /download/{file_id}.wav or .xml, so file_id
+    # arrives here ALREADY carrying an extension (FastAPI path params
+    # capture dots, they're not segment separators). The old code re-
+    # appended .wav/.xml on top of that, producing paths like
+    # "PianoMagic_<uuid>.wav.wav" that never existed on disk -> every
+    # download 404'd with "File not found" even though the file was
+    # saved correctly as "PianoMagic_<uuid>.wav". Strip any extension
+    # first and look up the exact file that was actually written.
+    stem = Path(file_id).stem
+    requested_ext = Path(file_id).suffix.lower()
+    candidates = [requested_ext] if requested_ext in ('.wav', '.xml') else ['.wav', '.xml']
+
+    for ext in candidates:
+        file_path = UPLOAD_DIR / f"PianoMagic_{stem}{ext}"
         if file_path.exists():
             media_type = 'audio/wav' if ext == '.wav' else 'application/vnd.recordare.musicxml+xml'
-            return FileResponse(str(file_path), media_type=media_type, 
-                              filename=f"PianoMagic_{file_id}{ext}")
+            return FileResponse(str(file_path), media_type=media_type,
+                              filename=f"PianoMagic_{stem}{ext}")
 
     raise HTTPException(404, "File not found")
 
