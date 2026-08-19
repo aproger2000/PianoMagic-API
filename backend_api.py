@@ -1,5 +1,5 @@
 """
-PianoMagic Backend API — v7.5.0
+PianoMagic Backend API — v7.6.0
 Audio-to-piano-score transcription
 """
 
@@ -25,10 +25,27 @@ from xml.dom import minidom
 import soundfile as sf
 from scipy.ndimage import median_filter
 
+# v7.6.0: Basic Pitch (Spotify's ICASSP-2022 neural AMT model) is the
+# primary transcription engine. It is imported defensively so that a
+# deploy where the wheel failed to install still boots and serves - it
+# just silently falls back to the old librosa/PYIN path instead of
+# 500-ing on every upload. Check /version at runtime to see which
+# engine a given deploy actually ended up with.
+BASIC_PITCH_AVAILABLE = False
+_BASIC_PITCH_IMPORT_ERROR = None
+try:
+    from basic_pitch.inference import predict as _bp_predict
+    from basic_pitch import ICASSP_2022_MODEL_PATH as _BP_MODEL_PATH
+    BASIC_PITCH_AVAILABLE = True
+    print("[INIT] basic-pitch available - using neural polyphonic transcription")
+except Exception as _e:  # ImportError, or a backend/runtime that failed to load
+    _BASIC_PITCH_IMPORT_ERROR = repr(_e)
+    print(f"[INIT] basic-pitch NOT available ({_e!r}) - falling back to librosa PYIN")
+
 # ───────────────────────────────────────────────────────────────
 # Configuration
 # ───────────────────────────────────────────────────────────────
-VERSION = "7.5.0"
+VERSION = "7.6.0"
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "pianomagic_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 print(f"[INIT] UPLOAD_DIR={UPLOAD_DIR}, exists={UPLOAD_DIR.exists()}")
@@ -100,7 +117,7 @@ def estimate_key(chroma: np.ndarray) -> str:
     return max(correlations, key=correlations.get)
 
 # ───────────────────────────────────────────────────────────────
-# Core Algorithm: v7.5.0
+# Core Algorithm: v7.6.0 (Basic Pitch neural polyphonic + PYIN fallback)
 # ───────────────────────────────────────────────────────────────
 def smooth_pitch(voice: np.ndarray, window: int = 7) -> np.ndarray:
     """Median filter to remove vibrato artifacts."""
@@ -231,6 +248,213 @@ def quantize_notes(notes: List[Note], time_grid_ms: float = 50) -> List[Note]:
             n.end = n.start + 0.12  # minimum 120ms
     return notes
 
+def _two_means_split_midi(midi_vals: np.ndarray, fallback: int = 60) -> int:
+    """
+    Find a natural boundary between the two dominant registers present in
+    a set of MIDI pitch values, via a simple 1D 2-means. Used to decide
+    where this particular track's RH/LH divide sits instead of always
+    assuming middle C. Clamped to C3..C6 so one odd track can't push the
+    boundary somewhere that leaves a hand empty by construction.
+    """
+    midi_vals = np.asarray(midi_vals, dtype=float)
+    midi_vals = midi_vals[np.isfinite(midi_vals)]
+    if len(midi_vals) < 40:
+        return fallback
+
+    c1, c2 = np.percentile(midi_vals, 25), np.percentile(midi_vals, 75)
+    for _ in range(25):
+        d1 = np.abs(midi_vals - c1)
+        d2 = np.abs(midi_vals - c2)
+        g1 = midi_vals[d1 <= d2]
+        g2 = midi_vals[d1 > d2]
+        if len(g1) == 0 or len(g2) == 0:
+            break
+        n1, n2 = g1.mean(), g2.mean()
+        done = abs(n1 - c1) < 0.01 and abs(n2 - c2) < 0.01
+        c1, c2 = n1, n2
+        if done:
+            break
+
+    lo, hi = sorted([c1, c2])
+    return max(48, min(72, int(round((lo + hi) / 2))))
+
+def _reduce_polyphony_to_two_voices(note_events, min_dur_ms: float = 80.0,
+                                    amp_frac_of_peak: float = 0.10):
+    """
+    v7.6.0: turn Basic Pitch's polyphonic note list into the two
+    monophonic voices a two-staff piano score can actually represent.
+
+    Basic Pitch returns EVERY note it hears - on a full arrangement
+    (vocal + accompaniment + percussion) that's hundreds of overlapping
+    events spanning the whole keyboard. Two things force a reduction:
+    musically, a dump of every detected partial is unreadable as sheet
+    music; mechanically, generate_musicxml_v72's emit_voice() walks a
+    single forward-only cursor per voice, so it cannot represent two
+    notes overlapping *within* one voice at all.
+
+    So we take the standard melody/bass skeleton: on a fine time grid,
+    the top sounding pitch becomes the right hand and the bottom
+    sounding pitch becomes the left hand. That's the reduction a person
+    arranging a song for piano would start from, and it's what makes the
+    result recognisable as the tune rather than as a cloud of notes.
+
+    Quiet detections are dropped first, since those are mostly percussion
+    smear and reverb tails rather than real notes. The threshold is a
+    fraction of the LOUDEST detection, deliberately not a percentile of
+    the amplitude distribution: percussion-heavy input can produce more
+    spurious notes than real ones, and a percentile gate silently moves
+    with them, so the junk survives its own gate. That failure mode is
+    especially damaging here because the right hand is taken as the top
+    sounding pitch - a swarm of weak high-register artefacts would
+    become "the melody" and reproduce exactly the noise this engine is
+    meant to eliminate. A peak-relative floor can't drift that way.
+    """
+    if not note_events:
+        return []
+
+    amps = np.array([ev[3] for ev in note_events], dtype=float)
+    amp_peak = float(amps.max()) if len(amps) else 0.0
+    amp_floor = amp_frac_of_peak * amp_peak
+    events = [ev for ev in note_events if ev[3] >= amp_floor and ev[1] > ev[0]]
+    if not events:
+        events = [ev for ev in note_events if ev[1] > ev[0]]
+    if not events:
+        return []
+
+    pitches = np.array([ev[2] for ev in events], dtype=float)
+    split_midi = _two_means_split_midi(pitches)
+    print(f"[EXTRACT] basic-pitch: {len(note_events)} raw events, {len(events)} after "
+          f"amplitude gate, RH/LH split at MIDI {split_midi}")
+
+    grid = 0.01  # 10 ms
+    t_end = max(ev[1] for ev in events)
+    n_frames = int(np.ceil(t_end / grid)) + 1
+    if n_frames <= 0 or n_frames > 2_000_000:
+        return []
+
+    top = np.full(n_frames, -1, dtype=int)
+    bottom = np.full(n_frames, -1, dtype=int)
+
+    for start, end, pitch, _amp, *_rest in events:
+        i0 = max(0, int(np.floor(start / grid)))
+        i1 = min(n_frames, int(np.ceil(end / grid)))
+        if i1 <= i0:
+            continue
+        seg_top = top[i0:i1]
+        seg_bot = bottom[i0:i1]
+        np.maximum(seg_top, pitch, out=seg_top)
+        empty = seg_bot < 0
+        seg_bot[empty] = pitch
+        np.minimum(seg_bot, pitch, out=seg_bot)
+
+    # Where only ONE pitch sounds, top == bottom. Give that note to the
+    # hand its register belongs to rather than duplicating it on both
+    # staves (which would read as a phantom unison).
+    same = (top == bottom) & (top >= 0)
+    rh_line = top.copy()
+    lh_line = bottom.copy()
+    rh_line[same & (top < split_midi)] = -1
+    lh_line[same & (top >= split_midi)] = -1
+
+    def runs_to_notes(line, hand):
+        notes = []
+        i = 0
+        n = len(line)
+        while i < n:
+            if line[i] < 0:
+                i += 1
+                continue
+            j = i
+            while j < n and line[j] == line[i]:
+                j += 1
+            dur_ms = (j - i) * grid * 1000
+            if dur_ms >= min_dur_ms:
+                notes.append(Note(start=i * grid, end=j * grid,
+                                  pitch_midi=int(line[i]), hand=hand))
+            i = j
+        return notes
+
+    rh = runs_to_notes(rh_line, "RH")
+    lh = runs_to_notes(lh_line, "LH")
+    print(f"[EXTRACT] basic-pitch reduction: RH={len(rh)} notes, LH={len(lh)} notes")
+    return sorted(rh + lh, key=lambda n: n.start)
+
+def extract_melody_basic_pitch(file_path, y: np.ndarray, sr: int) -> TranscriptionResult:
+    """
+    v7.6.0: primary engine. Basic Pitch is a neural polyphonic
+    transcription model, which is the actual fix for this service's
+    long-standing "output is just noise" problem.
+
+    Every previous version tracked pitch with librosa.pyin, which is
+    monophonic *by construction*: it estimates at most one f0 per frame.
+    Measuring the real test file showed ~10 simultaneous fundamentals in
+    99% of frames - i.e. a full arrangement, not a solo line. Handed
+    that, PYIN cannot report the melody plus the accompaniment; it
+    reports one pitch per instant and, where instruments compete, that
+    pitch lands on whichever partial happens to dominate. That is the
+    root cause the earlier fixes (register-restricted passes, adaptive
+    split, single broadband pass) were all working around rather than
+    addressing - none of them could have succeeded, because the
+    information was being discarded inside PYIN itself.
+
+    Tempo and key still come from librosa, which is fine - those are
+    global spectral/rhythmic statistics, not per-note decisions.
+    """
+    duration = librosa.get_duration(y=y, sr=sr)
+
+    print("[EXTRACT] Running Basic Pitch neural transcription...")
+    _model_out, _midi, note_events = _bp_predict(
+        str(file_path),
+        _BP_MODEL_PATH,
+        # A0-C7: the practical piano range. Bounding it keeps sub-bass
+        # rumble and cymbal-region artefacts out of the note list.
+        minimum_frequency=float(librosa.note_to_hz('A0')),
+        maximum_frequency=float(librosa.note_to_hz('C7')),
+        minimum_note_length=90.0,
+        melodia_trick=True,
+    )
+    print(f"[EXTRACT] Basic Pitch returned {len(note_events)} note events")
+
+    notes = _reduce_polyphony_to_two_voices(note_events)
+    notes = merge_close_notes(notes, max_gap_ms=90, max_pitch_diff_st=0.0)
+    notes = quantize_notes(notes)
+
+    tempo, key = _estimate_tempo_and_key(y, sr)
+
+    clean = [n for n in notes
+             if n.end > n.start and np.isfinite(n.start) and np.isfinite(n.end)
+             and 0 <= n.pitch_midi <= 127]
+    print(f"[EXTRACT] {len(clean)} clean notes returned (basic-pitch engine)")
+
+    return TranscriptionResult(notes=clean, tempo=tempo, key=key,
+                               duration=duration, sr=sr)
+
+def _estimate_tempo_and_key(y: np.ndarray, sr: int):
+    tempo = 120.0
+    try:
+        onset_env = librosa.onset.onset_strength(y=y, sr=sr)
+        try:
+            # librosa >= 0.10 moved this to feature.rhythm.tempo;
+            # librosa.beat.tempo still exists but is deprecated/removed
+            # in some versions, so fall back if needed.
+            tempo_est = librosa.feature.rhythm.tempo(onset_envelope=onset_env, sr=sr)
+        except AttributeError:
+            tempo_est = librosa.beat.tempo(onset_envelope=onset_env, sr=sr)
+        if isinstance(tempo_est, np.ndarray):
+            tempo_est = tempo_est[0]
+        tempo = float(tempo_est) if tempo_est > 40 else 120.0
+    except Exception:
+        pass
+
+    key = "C major"
+    try:
+        chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
+        key = estimate_key(chroma)
+    except Exception:
+        pass
+
+    return tempo, key
+
 def _estimate_hand_split(y: np.ndarray, sr: int, hop_length: int) -> int:
     """
     v7.4.3: the RH/LH register boundary was hardcoded at middle C (C4).
@@ -269,30 +493,9 @@ def _estimate_hand_split(y: np.ndarray, sr: int, hop_length: int) -> int:
             print(f"[EXTRACT] Split estimation: only {len(hz)} confident frames, falling back to fixed C4 split")
             return fallback_midi
 
-        midi_vals = librosa.hz_to_midi(hz)
-
-        # Simple 1D 2-means - a handful of iterations is plenty for 1D data.
-        c1, c2 = np.percentile(midi_vals, 25), np.percentile(midi_vals, 75)
-        for _ in range(25):
-            d1 = np.abs(midi_vals - c1)
-            d2 = np.abs(midi_vals - c2)
-            group1 = midi_vals[d1 <= d2]
-            group2 = midi_vals[d1 > d2]
-            if len(group1) == 0 or len(group2) == 0:
-                break
-            new_c1, new_c2 = group1.mean(), group2.mean()
-            converged = abs(new_c1 - c1) < 0.01 and abs(new_c2 - c2) < 0.01
-            c1, c2 = new_c1, new_c2
-            if converged:
-                break
-
-        lo, hi = sorted([c1, c2])
-        split_midi = int(round((lo + hi) / 2))
-        # Clamp so one unusual track can't push the boundary somewhere
-        # absurd (e.g. so far up/down that one hand ends up empty anyway).
-        split_midi = max(48, min(72, split_midi))  # clamp to C3..C6
-        print(f"[EXTRACT] Adaptive hand-split: cluster centers ~{lo:.1f}/{hi:.1f} MIDI -> "
-              f"split at MIDI {split_midi} (vs fixed-C4/MIDI60 fallback)")
+        split_midi = _two_means_split_midi(librosa.hz_to_midi(hz), fallback=fallback_midi)
+        print(f"[EXTRACT] Adaptive hand-split at MIDI {split_midi} "
+              f"(vs fixed-C4/MIDI60 fallback)")
         return split_midi
     except Exception as e:
         print(f"[EXTRACT WARN] Split estimation failed ({e}), falling back to fixed C4 split")
@@ -782,7 +985,18 @@ async def process_audio(task_id: str, file_path: Path):
         tasks[task_id]['status'] = 'analyzing'
         tasks[task_id]['progress'] = 30
 
-        result = extract_melody_librosa_v75(y, sr)
+        # v7.6.0: prefer the neural polyphonic engine; fall back to the
+        # monophonic PYIN pipeline if it's unavailable or errors out, so
+        # a bad wheel degrades quality instead of failing the request.
+        result = None
+        if BASIC_PITCH_AVAILABLE:
+            try:
+                result = extract_melody_basic_pitch(file_path, y, sr)
+            except Exception as e:
+                print(f"[TASK {task_id}] basic-pitch failed ({e!r}), falling back to PYIN")
+                traceback.print_exc()
+        if result is None:
+            result = extract_melody_librosa_v75(y, sr)
         print(f"[TASK {task_id}] Extracted {len(result.notes)} notes")
 
         tasks[task_id]['status'] = 'synthesizing'
@@ -868,7 +1082,16 @@ async def root():
 
 @app.get("/version")
 async def get_version():
-    return {"version": VERSION, "backend": VERSION, "api": "v1"}
+    return {
+        "version": VERSION,
+        "backend": VERSION,
+        "api": "v1",
+        # Which transcription engine this deploy actually loaded. If this
+        # says "librosa-pyin" the basic-pitch wheel didn't install and the
+        # service is running the old monophonic fallback.
+        "engine": "basic-pitch" if BASIC_PITCH_AVAILABLE else "librosa-pyin",
+        "basic_pitch_error": _BASIC_PITCH_IMPORT_ERROR,
+    }
 
 @app.get("/health")
 async def health_check():

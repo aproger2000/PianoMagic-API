@@ -5,3 +5,15 @@ numpy>=1.24.0
 librosa>=0.10.0
 soundfile>=0.12.0
 scipy>=1.11.0
+
+# v7.6.0: neural polyphonic transcription (Spotify Basic Pitch,
+# ICASSP 2022 model). This is the primary engine; librosa/PYIN above
+# is kept as the automatic fallback.
+#
+# Backend note: basic-pitch ships several inference runtimes and picks
+# one at import (TensorFlow > CoreML > TFLite > ONNX). onnxruntime is
+# pinned explicitly here because it's the smallest and most portable
+# of them on a Linux container - installing full TensorFlow would add
+# well over half a gigabyte to the image for no accuracy gain.
+basic-pitch>=0.4.0
+onnxruntime>=1.16.0

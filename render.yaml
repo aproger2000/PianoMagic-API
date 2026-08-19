@@ -3,10 +3,19 @@ services:
     name: pianomagic-api
     runtime: python
     plan: pro
-    buildCommand: "pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cpu"
+    # v7.6.0: was
+    #   pip install -r requirements.txt --index-url https://download.pytorch.org/whl/cpu
+    # --index-url REPLACES PyPI rather than adding to it, and the PyTorch
+    # wheel index only hosts torch-family packages - so every real
+    # dependency (fastapi, librosa, basic-pitch, onnxruntime...) would be
+    # unresolvable if this command were ever used. Nothing in this project
+    # needs torch at all. Restored to a plain install against PyPI.
+    buildCommand: "pip install -r requirements.txt"
     startCommand: "uvicorn backend_api:app --host 0.0.0.0 --port $PORT --workers 1"
     envVars:
       - key: PYTHON_VERSION
+        # basic-pitch supports Python 3.8-3.11; do not move past 3.11
+        # without checking that it still has wheels for the new version.
         value: 3.11.0
       - key: WEB_CONCURRENCY
         value: "1"
