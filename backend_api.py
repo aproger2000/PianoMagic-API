@@ -1,5 +1,5 @@
 """
-PianoMagic Backend API — v7.4.3
+PianoMagic Backend API — v7.5.0
 Audio-to-piano-score transcription
 """
 
@@ -28,7 +28,7 @@ from scipy.ndimage import median_filter
 # ───────────────────────────────────────────────────────────────
 # Configuration
 # ───────────────────────────────────────────────────────────────
-VERSION = "7.4.3"
+VERSION = "7.5.0"
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "pianomagic_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 print(f"[INIT] UPLOAD_DIR={UPLOAD_DIR}, exists={UPLOAD_DIR.exists()}")
@@ -100,7 +100,7 @@ def estimate_key(chroma: np.ndarray) -> str:
     return max(correlations, key=correlations.get)
 
 # ───────────────────────────────────────────────────────────────
-# Core Algorithm: v7.4.3
+# Core Algorithm: v7.5.0
 # ───────────────────────────────────────────────────────────────
 def smooth_pitch(voice: np.ndarray, window: int = 7) -> np.ndarray:
     """Median filter to remove vibrato artifacts."""
@@ -231,52 +231,6 @@ def quantize_notes(notes: List[Note], time_grid_ms: float = 50) -> List[Note]:
             n.end = n.start + 0.12  # minimum 120ms
     return notes
 
-def _track_voice_pyin(y: np.ndarray, sr: int, hop_length: int, fmin_note: str, fmax_note: str,
-                       prob_thresh: float = 0.1):
-    """
-    Run PYIN independently within ONE register (e.g. just the melody range,
-    or just the bass range) and return an f0 array masked down to frames
-    that are both voiced AND above a confidence floor.
-
-    This replaces the old approach of running PYIN ONCE over the full
-    C2-C7 range and then splitting the single resulting (already jittery,
-    monophonic) f0 trace into "high"/"low" by comparing each frame's raw
-    Hz value to a global amplitude threshold. That post-hoc split had two
-    problems: (a) it inherited whatever octave errors/noise PYIN produced
-    over the full wide range, and (b) because it decided high-vs-low
-    frame-by-frame with no continuity constraint, a single sustained note
-    that happened to sit near the threshold got chopped into many tiny
-    alternating RH/LH fragments.
-
-    Running PYIN separately per register instead means each pass gets
-    librosa's own internal probabilistic Viterbi smoothing *within* the
-    correct register, so both voices come out as continuous, stable
-    contours instead of a shared, fragmented one.
-    """
-    f0, voiced_flag, voiced_probs = librosa.pyin(
-        y,
-        fmin=librosa.note_to_hz(fmin_note),
-        fmax=librosa.note_to_hz(fmax_note),
-        sr=sr,
-        hop_length=hop_length,
-        frame_length=2048
-    )
-    times = librosa.frames_to_time(np.arange(len(f0)), sr=sr, hop_length=hop_length)
-    # Confidence gate: voiced_flag alone just means "PYIN's internal voicing
-    # probability crossed ~0.5"; frames near that boundary are exactly the
-    # jittery, low-confidence ones that fragment notes. Requiring
-    # voiced_probs >= prob_thresh on top of voiced_flag drops those.
-    # prob_thresh is intentionally low (0.1) by default: it's there to drop
-    # near-zero-confidence garbage, not to second-guess PYIN's own voiced/
-    # unvoiced decision. Logged both counts so a real run's logs show
-    # exactly how much this gate is removing, in case it needs retuning.
-    n_voiced_flag_only = int(np.sum(voiced_flag))
-    mask = voiced_flag & (voiced_probs >= prob_thresh)
-    voice = np.where(mask, f0, np.nan)
-    print(f"[EXTRACT]   {fmin_note}-{fmax_note}: voiced_flag frames={n_voiced_flag_only}, "
-          f"after prob>={prob_thresh} gate={int(np.sum(mask))}")
-    return voice, times, int(np.sum(mask))
-
 def _estimate_hand_split(y: np.ndarray, sr: int, hop_length: int) -> int:
     """
     v7.4.3: the RH/LH register boundary was hardcoded at middle C (C4).
@@ -344,60 +298,99 @@ def _estimate_hand_split(y: np.ndarray, sr: int, hop_length: int) -> int:
         print(f"[EXTRACT WARN] Split estimation failed ({e}), falling back to fixed C4 split")
         return fallback_midi
 
-def extract_melody_librosa_v73(y: np.ndarray, sr: int) -> TranscriptionResult:
+def extract_melody_librosa_v75(y: np.ndarray, sr: int) -> TranscriptionResult:
+    """
+    v7.5.0: replaces the "two independent register-restricted PYIN
+    passes" architecture from v7.3-v7.4.3.
+
+    That design assumed the source always contains two simultaneous
+    voices (RH melody + LH bass) that each stay inside their own
+    register the whole time - true for a genuine two-handed piano
+    recording. It breaks for a single melodic line (solo instrument,
+    voice, simple song) whose real pitch legitimately wanders both
+    above and below the RH/LH boundary: at any instant where the true
+    note sits outside a given pass's allowed register, that pass has
+    nothing real to find - but PYIN is still forced to report its best
+    IN-BAND candidate for every frame it considers voiced, so it can
+    lock onto a harmonic/subharmonic echo of the real note instead of
+    correctly reporting silence. Confirmed on a real test file: with
+    both the fixed-C4 split (v7.4.2) and the adaptive split (v7.4.3),
+    the RH pass stayed almost entirely empty rests while LH carried
+    what was clearly the actual tune, because that track's real melody
+    is a single line, not two simultaneous voices.
+
+    Fix: track ONE continuous line across the whole practical range in
+    a single PYIN pass, so its own internal Viterbi smoothing always
+    sees the true note wherever it is - no register can starve it.
+    Hand/staff assignment then happens per completed NOTE afterwards
+    (via _estimate_hand_split), not per frame during detection, which
+    also avoids the original pre-v7.3 bug where a per-frame threshold
+    split chopped single sustained notes into alternating RH/LH
+    fragments near the boundary.
+
+    Trade-off worth knowing: because this is one monophonic pitch
+    track, two *genuinely* simultaneous notes (e.g. an actual chord,
+    or true two-handed piano polyphony) can't both be captured at the
+    same instant - only the stronger one will. That was already true
+    of the original pre-v7.3 implementation this restores the shape
+    of; real polyphonic transcription would need a different class of
+    model entirely (see the note left in extract_melody's caller).
+    """
     duration = librosa.get_duration(y=y, sr=sr)
     if len(y) < 2048:
         print(f"[EXTRACT WARN] Audio too short: {len(y)} samples")
         return TranscriptionResult(notes=[], tempo=120.0, key="C major", duration=duration, sr=sr)
 
     hop_length = 512
+    prob_thresh = 0.1
 
-    # 0. Figure out where THIS track's melody/bass boundary actually is
-    # (see _estimate_hand_split) instead of assuming it's always C4.
-    print("[EXTRACT] Estimating adaptive RH/LH register split...")
+    # 1. Single broadband PYIN pass across the practical piano range.
+    print("[EXTRACT] Running single broadband PYIN pass (A0-C7)...")
+    f0, voiced_flag, voiced_probs = librosa.pyin(
+        y,
+        fmin=librosa.note_to_hz('A0'),
+        fmax=librosa.note_to_hz('C7'),
+        sr=sr,
+        hop_length=hop_length,
+        frame_length=2048
+    )
+    times = librosa.frames_to_time(np.arange(len(f0)), sr=sr, hop_length=hop_length)
+    n_voiced_flag_only = int(np.sum(voiced_flag))
+    mask = voiced_flag & (voiced_probs >= prob_thresh)
+    voice = np.where(mask, f0, np.nan)
+    print(f"[EXTRACT] voiced_flag frames={n_voiced_flag_only}, after prob>={prob_thresh} gate={int(np.sum(mask))}")
+
+    # 2. Fill short gaps
+    v_filled = fill_short_gaps(voice, times, max_gap_ms=100)
+
+    # 3. Smooth pitch contour (remove vibrato)
+    v_smooth = smooth_pitch(v_filled, window=7)
+
+    # 4. Segment into whole notes (hand is a placeholder here - assigned
+    # for real in step 6, per note rather than per frame).
+    print("[EXTRACT] Segmenting melody line...")
+    notes_all = segment_pitch_contour(v_smooth, times, hand="RH", min_dur_ms=120, pause_thresh_ms=250, pitch_jump_st=1.5)
+    print(f"[EXTRACT] Raw segments: {len(notes_all)}")
+
+    # 5. Merge close notes (aggressive)
+    notes_all = merge_close_notes(notes_all, max_gap_ms=150, max_pitch_diff_st=1.5)
+    print(f"[EXTRACT] After merge: {len(notes_all)}")
+
+    # 6. Assign RH/LH per completed note, using the same adaptive split
+    # point _estimate_hand_split computes (falls back to fixed C4 if
+    # there's too little confidently-voiced content to cluster).
     split_midi = _estimate_hand_split(y, sr, hop_length)
-    # Small overlap around the split (+/-4 semitones) is intentional: real
-    # melodies dip below the boundary and real bass/accompaniment lines
-    # can rise above it.
-    rh_low_note = librosa.midi_to_note(max(21, split_midi - 4), unicode=False)
-    lh_high_note = librosa.midi_to_note(min(96, split_midi + 4), unicode=False)
-
-    # 1-2. Two independent, register-restricted PYIN passes (RH melody
-    # register / LH bass register) instead of one wideband pass split by
-    # a raw Hz threshold.
-    print(f"[EXTRACT] Running PYIN for RH (melody) register {rh_low_note}-C6...")
-    voice_high, times, n_high = _track_voice_pyin(y, sr, hop_length, rh_low_note, 'C6')
-    print(f"[EXTRACT] RH voiced+confident frames: {n_high}")
-
-    print(f"[EXTRACT] Running PYIN for LH (bass) register A0-{lh_high_note}...")
-    voice_low, _, n_low = _track_voice_pyin(y, sr, hop_length, 'A0', lh_high_note)
-    print(f"[EXTRACT] LH voiced+confident frames: {n_low}")
-
-    # 3. Fill short gaps
-    vh_filled = fill_short_gaps(voice_high, times, max_gap_ms=100)
-    vl_filled = fill_short_gaps(voice_low, times, max_gap_ms=100)
-
-    # 4. Smooth pitch contours (remove vibrato)
-    vh_smooth = smooth_pitch(vh_filled, window=7)
-    vl_smooth = smooth_pitch(vl_filled, window=7)
-
-    # 5. Segment with relaxed thresholds
-    print("[EXTRACT] Segmenting voices...")
-    notes_high = segment_pitch_contour(vh_smooth, times, hand="RH", min_dur_ms=120, pause_thresh_ms=250, pitch_jump_st=1.5)
-    notes_low = segment_pitch_contour(vl_smooth, times, hand="LH", min_dur_ms=120, pause_thresh_ms=250, pitch_jump_st=1.5)
-    print(f"[EXTRACT] Raw segments: RH={len(notes_high)}, LH={len(notes_low)}")
-
-    # 6. Merge close notes (aggressive)
-    notes_high = merge_close_notes(notes_high, max_gap_ms=150, max_pitch_diff_st=1.5)
-    notes_low = merge_close_notes(notes_low, max_gap_ms=150, max_pitch_diff_st=1.5)
-    print(f"[EXTRACT] After merge: RH={len(notes_high)}, LH={len(notes_low)}")
+    for n in notes_all:
+        n.hand = "RH" if n.pitch_midi >= split_midi else "LH"
+    n_rh = sum(1 for n in notes_all if n.hand == "RH")
+    n_lh = len(notes_all) - n_rh
+    print(f"[EXTRACT] Hand split at MIDI {split_midi}: RH={n_rh} notes, LH={n_lh} notes")
 
     # 7. Quantize timing
-    notes_high = quantize_notes(notes_high)
-    notes_low = quantize_notes(notes_low)
+    notes_all = quantize_notes(notes_all)
 
-    # 8. Combine and sort
-    all_notes = sorted(notes_high + notes_low, key=lambda n: n.start)
+    # 8. Sort
+    all_notes = sorted(notes_all, key=lambda n: n.start)
 
     # 9. Estimate tempo and key
     tempo = 120.0
@@ -789,7 +782,7 @@ async def process_audio(task_id: str, file_path: Path):
         tasks[task_id]['status'] = 'analyzing'
         tasks[task_id]['progress'] = 30
 
-        result = extract_melody_librosa_v73(y, sr)
+        result = extract_melody_librosa_v75(y, sr)
         print(f"[TASK {task_id}] Extracted {len(result.notes)} notes")
 
         tasks[task_id]['status'] = 'synthesizing'
