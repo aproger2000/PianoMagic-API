@@ -1,5 +1,5 @@
 """
-PianoMagic Backend API — v7.2.1
+PianoMagic Backend API — v7.3.0
 Audio-to-piano-score transcription
 """
 
@@ -28,7 +28,7 @@ from scipy.ndimage import median_filter
 # ───────────────────────────────────────────────────────────────
 # Configuration
 # ───────────────────────────────────────────────────────────────
-VERSION = "7.2.1"
+VERSION = "7.3.0"
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "pianomagic_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 print(f"[INIT] UPLOAD_DIR={UPLOAD_DIR}, exists={UPLOAD_DIR.exists()}")
@@ -100,7 +100,7 @@ def estimate_key(chroma: np.ndarray) -> str:
     return max(correlations, key=correlations.get)
 
 # ───────────────────────────────────────────────────────────────
-# Core Algorithm: v7.2.1
+# Core Algorithm: v7.3.0
 # ───────────────────────────────────────────────────────────────
 def smooth_pitch(voice: np.ndarray, window: int = 7) -> np.ndarray:
     """Median filter to remove vibrato artifacts."""
@@ -231,42 +231,65 @@ def quantize_notes(notes: List[Note], time_grid_ms: float = 50) -> List[Note]:
             n.end = n.start + 0.12  # minimum 120ms
     return notes
 
-def extract_melody_librosa_v72(y: np.ndarray, sr: int) -> TranscriptionResult:
-    duration = librosa.get_duration(y=y, sr=sr)
-    if len(y) < 2048:
-        print(f"[EXTRACT WARN] Audio too short: {len(y)} samples")
-        return TranscriptionResult(notes=[], tempo=120.0, key="C major", duration=duration, sr=sr)
+def _track_voice_pyin(y: np.ndarray, sr: int, hop_length: int, fmin_note: str, fmax_note: str,
+                       prob_thresh: float = 0.5):
+    """
+    Run PYIN independently within ONE register (e.g. just the melody range,
+    or just the bass range) and return an f0 array masked down to frames
+    that are both voiced AND above a confidence floor.
 
-    # 1. PYIN with moderate hop (balance between resolution and noise)
-    hop_length = 512
-    print(f"[EXTRACT] Running PYIN, hop={hop_length}...")
+    This replaces the old approach of running PYIN ONCE over the full
+    C2-C7 range and then splitting the single resulting (already jittery,
+    monophonic) f0 trace into "high"/"low" by comparing each frame's raw
+    Hz value to a global amplitude threshold. That post-hoc split had two
+    problems: (a) it inherited whatever octave errors/noise PYIN produced
+    over the full wide range, and (b) because it decided high-vs-low
+    frame-by-frame with no continuity constraint, a single sustained note
+    that happened to sit near the threshold got chopped into many tiny
+    alternating RH/LH fragments.
+
+    Running PYIN separately per register instead means each pass gets
+    librosa's own internal probabilistic Viterbi smoothing *within* the
+    correct register, so both voices come out as continuous, stable
+    contours instead of a shared, fragmented one.
+    """
     f0, voiced_flag, voiced_probs = librosa.pyin(
         y,
-        fmin=librosa.note_to_hz('C2'),
-        fmax=librosa.note_to_hz('C7'),
+        fmin=librosa.note_to_hz(fmin_note),
+        fmax=librosa.note_to_hz(fmax_note),
         sr=sr,
         hop_length=hop_length,
         frame_length=2048
     )
     times = librosa.frames_to_time(np.arange(len(f0)), sr=sr, hop_length=hop_length)
-    print(f"[EXTRACT] PYIN done: {np.sum(voiced_flag)} voiced frames out of {len(f0)}")
+    # Confidence gate: voiced_flag alone just means "PYIN's internal voicing
+    # probability crossed ~0.5"; frames near that boundary are exactly the
+    # jittery, low-confidence ones that fragment notes. Requiring
+    # voiced_probs >= prob_thresh on top of voiced_flag drops those.
+    mask = voiced_flag & (voiced_probs >= prob_thresh)
+    voice = np.where(mask, f0, np.nan)
+    return voice, times, int(np.sum(mask))
 
-    # 2. Adaptive voice separation using median split
-    valid_f0 = f0[voiced_flag]
-    if len(valid_f0) >= 2:
-        median_f0 = np.median(valid_f0)
-        # Use 0.6x median as threshold (slightly lower to catch more melody)
-        threshold = median_f0 * 0.6
-        print(f"[EXTRACT] Adaptive threshold: {threshold:.1f} Hz (median={median_f0:.1f})")
-        high_mask = (f0 > threshold) & voiced_flag
-        low_mask = (f0 <= threshold) & voiced_flag
-    else:
-        high_mask = voiced_flag
-        low_mask = np.zeros_like(voiced_flag, dtype=bool)
+def extract_melody_librosa_v73(y: np.ndarray, sr: int) -> TranscriptionResult:
+    duration = librosa.get_duration(y=y, sr=sr)
+    if len(y) < 2048:
+        print(f"[EXTRACT WARN] Audio too short: {len(y)} samples")
+        return TranscriptionResult(notes=[], tempo=120.0, key="C major", duration=duration, sr=sr)
 
-    voice_high = np.where(high_mask, f0, np.nan)
-    voice_low = np.where(low_mask, f0, np.nan)
-    print(f"[EXTRACT] High voice frames: {np.sum(high_mask)}, Low: {np.sum(low_mask)}")
+    hop_length = 512
+
+    # 1-2. Two independent, register-restricted PYIN passes (RH melody
+    # register / LH bass register) instead of one wideband pass split by
+    # a raw Hz threshold. A small overlap around middle C (C3-C6 vs
+    # A0-C4) is intentional: real melodies dip below middle C and real
+    # bass/accompaniment lines can rise above it.
+    print("[EXTRACT] Running PYIN for RH (melody) register C3-C6...")
+    voice_high, times, n_high = _track_voice_pyin(y, sr, hop_length, 'C3', 'C6')
+    print(f"[EXTRACT] RH voiced+confident frames: {n_high}")
+
+    print("[EXTRACT] Running PYIN for LH (bass) register A0-C4...")
+    voice_low, _, n_low = _track_voice_pyin(y, sr, hop_length, 'A0', 'C4')
+    print(f"[EXTRACT] LH voiced+confident frames: {n_low}")
 
     # 3. Fill short gaps
     vh_filled = fill_short_gaps(voice_high, times, max_gap_ms=100)
@@ -298,7 +321,13 @@ def extract_melody_librosa_v72(y: np.ndarray, sr: int) -> TranscriptionResult:
     tempo = 120.0
     try:
         onset_env = librosa.onset.onset_strength(y=y, sr=sr)
-        tempo_est = librosa.beat.tempo(onset_envelope=onset_env, sr=sr)
+        try:
+            # librosa >= 0.10 moved this to feature.rhythm.tempo;
+            # librosa.beat.tempo still exists but is deprecated/removed
+            # in some versions, so fall back if needed.
+            tempo_est = librosa.feature.rhythm.tempo(onset_envelope=onset_env, sr=sr)
+        except AttributeError:
+            tempo_est = librosa.beat.tempo(onset_envelope=onset_env, sr=sr)
         if isinstance(tempo_est, np.ndarray):
             tempo_est = tempo_est[0]
         tempo = float(tempo_est) if tempo_est > 40 else 120.0
@@ -621,7 +650,7 @@ async def process_audio(task_id: str, file_path: Path):
         tasks[task_id]['status'] = 'analyzing'
         tasks[task_id]['progress'] = 30
 
-        result = extract_melody_librosa_v72(y, sr)
+        result = extract_melody_librosa_v73(y, sr)
         print(f"[TASK {task_id}] Extracted {len(result.notes)} notes")
 
         tasks[task_id]['status'] = 'synthesizing'
