@@ -1,5 +1,5 @@
 """
-PianoMagic Backend API — v7.3.0
+PianoMagic Backend API — v7.4.0
 Audio-to-piano-score transcription
 """
 
@@ -28,7 +28,7 @@ from scipy.ndimage import median_filter
 # ───────────────────────────────────────────────────────────────
 # Configuration
 # ───────────────────────────────────────────────────────────────
-VERSION = "7.3.0"
+VERSION = "7.4.0"
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "pianomagic_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 print(f"[INIT] UPLOAD_DIR={UPLOAD_DIR}, exists={UPLOAD_DIR.exists()}")
@@ -100,7 +100,7 @@ def estimate_key(chroma: np.ndarray) -> str:
     return max(correlations, key=correlations.get)
 
 # ───────────────────────────────────────────────────────────────
-# Core Algorithm: v7.3.0
+# Core Algorithm: v7.4.0
 # ───────────────────────────────────────────────────────────────
 def smooth_pitch(voice: np.ndarray, window: int = 7) -> np.ndarray:
     """Median filter to remove vibrato artifacts."""
@@ -232,7 +232,7 @@ def quantize_notes(notes: List[Note], time_grid_ms: float = 50) -> List[Note]:
     return notes
 
 def _track_voice_pyin(y: np.ndarray, sr: int, hop_length: int, fmin_note: str, fmax_note: str,
-                       prob_thresh: float = 0.5):
+                       prob_thresh: float = 0.1):
     """
     Run PYIN independently within ONE register (e.g. just the melody range,
     or just the bass range) and return an f0 array masked down to frames
@@ -266,8 +266,15 @@ def _track_voice_pyin(y: np.ndarray, sr: int, hop_length: int, fmin_note: str, f
     # probability crossed ~0.5"; frames near that boundary are exactly the
     # jittery, low-confidence ones that fragment notes. Requiring
     # voiced_probs >= prob_thresh on top of voiced_flag drops those.
+    # prob_thresh is intentionally low (0.1) by default: it's there to drop
+    # near-zero-confidence garbage, not to second-guess PYIN's own voiced/
+    # unvoiced decision. Logged both counts so a real run's logs show
+    # exactly how much this gate is removing, in case it needs retuning.
+    n_voiced_flag_only = int(np.sum(voiced_flag))
     mask = voiced_flag & (voiced_probs >= prob_thresh)
     voice = np.where(mask, f0, np.nan)
+    print(f"[EXTRACT]   {fmin_note}-{fmax_note}: voiced_flag frames={n_voiced_flag_only}, "
+          f"after prob>={prob_thresh} gate={int(np.sum(mask))}")
     return voice, times, int(np.sum(mask))
 
 def extract_melody_librosa_v73(y: np.ndarray, sr: int) -> TranscriptionResult:
