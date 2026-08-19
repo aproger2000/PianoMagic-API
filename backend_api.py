@@ -1,5 +1,5 @@
 """
-PianoMagic Backend API — v7.6.0
+PianoMagic Backend API — v7.6.1
 Audio-to-piano-score transcription
 """
 
@@ -33,6 +33,15 @@ from scipy.ndimage import median_filter
 # engine a given deploy actually ended up with.
 BASIC_PITCH_AVAILABLE = False
 _BASIC_PITCH_IMPORT_ERROR = None
+# v7.6.1: importing basic-pitch successfully does NOT mean it can actually
+# run - loading the ONNX/TFLite graph and doing inference happen later, per
+# request. v7.6.0 caught those runtime failures and silently fell back to
+# PYIN, so /version reported engine="basic-pitch" while every transcription
+# was really produced by the old monophonic path; the output was byte-for-byte
+# identical to v7.5.0 and there was no way to tell from outside. The last
+# runtime failure is now recorded here and surfaced on /version and on the
+# task result, so a silent fallback can't masquerade as a working engine.
+LAST_ENGINE_ERROR = None
 try:
     from basic_pitch.inference import predict as _bp_predict
     from basic_pitch import ICASSP_2022_MODEL_PATH as _BP_MODEL_PATH
@@ -45,12 +54,78 @@ except Exception as _e:  # ImportError, or a backend/runtime that failed to load
 # ───────────────────────────────────────────────────────────────
 # Configuration
 # ───────────────────────────────────────────────────────────────
-VERSION = "7.6.0"
+VERSION = "7.6.1"
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "pianomagic_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 print(f"[INIT] UPLOAD_DIR={UPLOAD_DIR}, exists={UPLOAD_DIR.exists()}")
 
 tasks: Dict[str, dict] = {}
+
+# ───────────────────────────────────────────────────────────────
+# Diagnostics / per-task logging (v7.6.1)
+# ───────────────────────────────────────────────────────────────
+# Every stage of the pipeline already print()s what it's doing, but those
+# lines only ever reached the Render console - invisible from the browser.
+# When v7.6.0's neural engine failed at runtime and silently fell back,
+# the UI looked completely normal and the regression was only detectable
+# by byte-comparing two downloads. These helpers tee the same output into
+# a per-task buffer that the frontend can show and copy, so what actually
+# happened during a run is visible without server access.
+
+def _env_report() -> List[str]:
+    """Versions and engine state - the first thing worth knowing when a
+    run misbehaves, and the thing that's hardest to guess from outside."""
+    import platform
+    lines = [
+        f"PianoMagic backend      : v{VERSION}",
+        f"Python                  : {platform.python_version()} ({platform.platform()})",
+    ]
+    for mod in ("numpy", "scipy", "librosa", "soundfile", "basic_pitch", "onnxruntime",
+                "tensorflow", "tflite_runtime"):
+        try:
+            m = __import__(mod)
+            lines.append(f"{mod:<24}: {getattr(m, '__version__', 'unknown')}")
+        except Exception:
+            lines.append(f"{mod:<24}: NOT INSTALLED")
+    lines.append(f"basic-pitch importable  : {BASIC_PITCH_AVAILABLE}")
+    if _BASIC_PITCH_IMPORT_ERROR:
+        lines.append(f"basic-pitch import error: {_BASIC_PITCH_IMPORT_ERROR}")
+    if BASIC_PITCH_AVAILABLE:
+        try:
+            lines.append(f"basic-pitch model path  : {_BP_MODEL_PATH}")
+        except Exception:
+            pass
+    return lines
+
+class _TeeLog:
+    """Writes to the real stdout AND into a task's log buffer.
+
+    Used with contextlib.redirect_stdout so the pipeline's existing
+    print() calls are captured without having to rewrite every one of
+    them - which also means any future print() is logged automatically
+    rather than being forgotten.
+    """
+    def __init__(self, buf: List[str], stream):
+        self._buf = buf
+        self._stream = stream
+        self._partial = ''
+
+    def write(self, text):
+        try:
+            self._stream.write(text)
+        except Exception:
+            pass
+        self._partial += text
+        while '\n' in self._partial:
+            line, self._partial = self._partial.split('\n', 1)
+            self._buf.append(line)
+        return len(text)
+
+    def flush(self):
+        try:
+            self._stream.flush()
+        except Exception:
+            pass
 
 # ───────────────────────────────────────────────────────────────
 # FastAPI App
@@ -402,17 +477,31 @@ def extract_melody_basic_pitch(file_path, y: np.ndarray, sr: int) -> Transcripti
     """
     duration = librosa.get_duration(y=y, sr=sr)
 
-    print("[EXTRACT] Running Basic Pitch neural transcription...")
-    _model_out, _midi, note_events = _bp_predict(
-        str(file_path),
-        _BP_MODEL_PATH,
-        # A0-C7: the practical piano range. Bounding it keeps sub-bass
-        # rumble and cymbal-region artefacts out of the note list.
-        minimum_frequency=float(librosa.note_to_hz('A0')),
-        maximum_frequency=float(librosa.note_to_hz('C7')),
-        minimum_note_length=90.0,
-        melodia_trick=True,
-    )
+    # Hand Basic Pitch a plain 22.05 kHz mono WAV decoded by us, rather
+    # than the raw upload. The upload may be .mp3/.m4a/.ogg, and letting
+    # the library re-open and re-decode it adds a failure mode we've
+    # already cleared - librosa decoded this same file moments ago in
+    # process_audio. 22050 Hz mono is exactly what the model consumes
+    # internally, so this also skips a redundant resample.
+    tmp_wav = UPLOAD_DIR / f"_bp_input_{uuid.uuid4().hex}.wav"
+    try:
+        sf.write(str(tmp_wav), y, sr, subtype='PCM_16')
+        print(f"[EXTRACT] Running Basic Pitch on {tmp_wav.name} ({duration:.1f}s)...")
+        _model_out, _midi, note_events = _bp_predict(
+            str(tmp_wav),
+            _BP_MODEL_PATH,
+            # A0-C7: the practical piano range. Bounding it keeps sub-bass
+            # rumble and cymbal-region artefacts out of the note list.
+            minimum_frequency=float(librosa.note_to_hz('A0')),
+            maximum_frequency=float(librosa.note_to_hz('C7')),
+            minimum_note_length=90.0,
+            melodia_trick=True,
+        )
+    finally:
+        try:
+            tmp_wav.unlink(missing_ok=True)
+        except Exception:
+            pass
     print(f"[EXTRACT] Basic Pitch returned {len(note_events)} note events")
 
     notes = _reduce_polyphony_to_two_voices(note_events)
@@ -973,6 +1062,24 @@ def compare_audio_features(original_y: np.ndarray, synth_y: np.ndarray, sr: int)
 # Background Task
 # ───────────────────────────────────────────────────────────────
 async def process_audio(task_id: str, file_path: Path):
+    log_buf: List[str] = tasks[task_id].setdefault('log', [])
+    log_buf.append("=" * 62)
+    log_buf.append(f"PianoMagic run log - task {task_id}")
+    log_buf.append(f"started (UTC)           : {datetime.utcnow().isoformat()}")
+    log_buf.append(f"source file             : {tasks[task_id].get('filename')}")
+    log_buf.extend(_env_report())
+    log_buf.append("=" * 62)
+
+    import contextlib, sys as _sys
+    tee = _TeeLog(log_buf, _sys.stdout)
+    with contextlib.redirect_stdout(tee):
+        await _process_audio_inner(task_id, file_path)
+    tee.flush()
+    if tee._partial:
+        log_buf.append(tee._partial)
+    log_buf.append(f"finished (UTC)          : {datetime.utcnow().isoformat()}")
+
+async def _process_audio_inner(task_id: str, file_path: Path):
     try:
         tasks[task_id]['status'] = 'loading'
         tasks[task_id]['progress'] = 10
@@ -988,16 +1095,25 @@ async def process_audio(task_id: str, file_path: Path):
         # v7.6.0: prefer the neural polyphonic engine; fall back to the
         # monophonic PYIN pipeline if it's unavailable or errors out, so
         # a bad wheel degrades quality instead of failing the request.
+        global LAST_ENGINE_ERROR
         result = None
+        engine_used = "librosa-pyin"
+        engine_error = None
         if BASIC_PITCH_AVAILABLE:
             try:
                 result = extract_melody_basic_pitch(file_path, y, sr)
+                engine_used = "basic-pitch"
+                LAST_ENGINE_ERROR = None
             except Exception as e:
-                print(f"[TASK {task_id}] basic-pitch failed ({e!r}), falling back to PYIN")
-                traceback.print_exc()
+                engine_error = traceback.format_exc()
+                LAST_ENGINE_ERROR = engine_error
+                print(f"[TASK {task_id}] basic-pitch FAILED at runtime "
+                      f"({e!r}) - falling back to PYIN. Traceback:")
+                print(engine_error)
         if result is None:
             result = extract_melody_librosa_v75(y, sr)
-        print(f"[TASK {task_id}] Extracted {len(result.notes)} notes")
+        print(f"[TASK {task_id}] Extracted {len(result.notes)} notes "
+              f"via engine={engine_used}")
 
         tasks[task_id]['status'] = 'synthesizing'
         tasks[task_id]['progress'] = 60
@@ -1061,7 +1177,13 @@ async def process_audio(task_id: str, file_path: Path):
             'notes': notes_json,
             'comparison': comparison,
             'wav_url': f'/download/{file_id}.wav',
-            'xml_url': f'/download/{file_id}.xml'
+            'xml_url': f'/download/{file_id}.xml',
+            # Which engine actually produced these notes. Reported per
+            # result, not just per process, because the neural engine can
+            # import cleanly and still fail per request - in which case
+            # this says "librosa-pyin" and engine_error holds the reason.
+            'engine': engine_used,
+            'engine_error': engine_error,
         }
         print(f"[TASK {task_id}] COMPLETED")
 
@@ -1086,12 +1208,25 @@ async def get_version():
         "version": VERSION,
         "backend": VERSION,
         "api": "v1",
-        # Which transcription engine this deploy actually loaded. If this
-        # says "librosa-pyin" the basic-pitch wheel didn't install and the
-        # service is running the old monophonic fallback.
+        # Which engine this deploy IMPORTED. Note this is not proof it
+        # works: v7.6.0 reported "basic-pitch" here while every actual
+        # transcription silently fell back to PYIN because inference threw
+        # per request. last_engine_error below is the honest signal - if
+        # it's non-null, the neural engine is failing at runtime and
+        # results are coming from the monophonic fallback.
         "engine": "basic-pitch" if BASIC_PITCH_AVAILABLE else "librosa-pyin",
         "basic_pitch_error": _BASIC_PITCH_IMPORT_ERROR,
+        "last_engine_error": LAST_ENGINE_ERROR,
+        "env": _env_report(),
     }
+
+@app.get("/logs/{task_id}")
+async def get_logs(task_id: str):
+    """Plain-text run log for one transcription, for copy/paste."""
+    if task_id not in tasks:
+        raise HTTPException(404, "Task not found")
+    from fastapi.responses import PlainTextResponse
+    return PlainTextResponse("\n".join(tasks[task_id].get('log', [])))
 
 @app.get("/health")
 async def health_check():

@@ -15,5 +15,12 @@ scipy>=1.11.0
 # pinned explicitly here because it's the smallest and most portable
 # of them on a Linux container - installing full TensorFlow would add
 # well over half a gigabyte to the image for no accuracy gain.
-basic-pitch>=0.4.0
+#
+# v7.6.1: use the [onnx] extra rather than bare basic-pitch plus a
+# separate onnxruntime pin. In v7.6.0 the package imported fine but
+# inference threw on every request, and installing the runtime alongside
+# the package is not the same as telling the package which runtime it is
+# built for - the extra pulls the matching model assets too, so the
+# selected backend and the bundled graph can't disagree.
+basic-pitch[onnx]>=0.4.0
 onnxruntime>=1.16.0

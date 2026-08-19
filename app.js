@@ -1,6 +1,6 @@
-/* PianoMagic Frontend — v7.2.1 */
+/* PianoMagic Frontend — v7.6.1 */
 
-const FE_VERSION = '7.6.0';
+const FE_VERSION = '7.6.1';
 const API_BASE = 'https://pianomagic-api.onrender.com';
 
 // State
@@ -230,9 +230,16 @@ async function pollStatus(taskId) {
 
         if (data.status === 'completed') {
             clearInterval(pollInterval);
+            setRunLog(data);
             showResults(data.result);
         } else if (data.status === 'error') {
             clearInterval(pollInterval);
+            // A failed run is exactly when the log matters most, so make
+            // it available here too rather than only on success.
+            setRunLog(data);
+            const lb = document.getElementById('logBox');
+            lb.classList.remove('hidden');
+            lb.open = true;
             updateProgress(0, `Ошибка: ${data.error || 'Unknown error'}`);
         }
     } catch (e) {
@@ -310,6 +317,20 @@ function showResults(result) {
     const xmlUrl = result.xml_url ? `${API_BASE}${result.xml_url}` : '#';
     document.getElementById('downloadWav').href = wavUrl;
     document.getElementById('downloadXml').href = xmlUrl;
+
+    // Say plainly which engine produced this result. The neural engine
+    // can import fine and still fail per request, in which case the notes
+    // silently come from the old monophonic fallback - that happened in
+    // v7.6.0 and was invisible in the UI. It should never be invisible.
+    const banner = document.getElementById('engineBanner');
+    if (result.engine === 'basic-pitch') {
+        banner.textContent = '🧠 Движок: Basic Pitch (нейросетевой, полифонический)';
+        banner.className = 'engine-banner engine-ok';
+    } else {
+        banner.textContent = '⚠️ Движок: librosa PYIN (монофонический запасной вариант)'
+            + (result.engine_error ? ' — нейросетевой движок упал, подробности в логе' : '');
+        banner.className = 'engine-banner engine-warn';
+    }
 
     audioPlayer.src = wavUrl;
     audioPlayer.load();
@@ -661,3 +682,82 @@ function animatePlayhead() {
 
     animationFrame = requestAnimationFrame(animatePlayhead);
 }
+
+// ─────────────────────────────────────────────
+// Run log (v7.6.1)
+// ─────────────────────────────────────────────
+// The pipeline reports every stage it runs, but until now that output
+// existed only in the server console. Surfacing it here is what makes a
+// silent engine fallback or a runtime failure diagnosable from a normal
+// browser session instead of requiring deploy-log access.
+let currentRunLog = '';
+
+function setRunLog(data) {
+    const lines = Array.isArray(data.log) ? data.log.slice() : [];
+    if (data.traceback) {
+        lines.push('', '--- TRACEBACK ---', data.traceback);
+    }
+    currentRunLog = lines.join('\n');
+    const logText = document.getElementById('logText');
+    const logBox = document.getElementById('logBox');
+    if (logText) logText.textContent = currentRunLog || '(лог пуст)';
+    if (logBox && currentRunLog) logBox.classList.remove('hidden');
+    // Reveal the diagnostics block itself - it starts hidden so it doesn't
+    // clutter the page before a run has produced anything to show.
+    const diag = document.getElementById('diagnosticsSection');
+    if (diag) diag.classList.remove('hidden');
+}
+
+async function copyRunLog() {
+    const btn = document.getElementById('copyLog');
+    let text = currentRunLog;
+
+    // Fall back to fetching the log directly if polling didn't capture it
+    // (e.g. the page was reloaded mid-run).
+    if (!text && currentTaskId) {
+        try {
+            const res = await fetch(`${API_BASE}/logs/${currentTaskId}`);
+            if (res.ok) text = await res.text();
+        } catch (e) { /* fall through to the empty-log message below */ }
+    }
+    if (!text) {
+        btn.textContent = '❌ Лог пуст';
+        setTimeout(() => { btn.textContent = '📋 Копировать лог'; }, 2000);
+        return;
+    }
+
+    let ok = false;
+    try {
+        // navigator.clipboard needs a secure context and can be blocked by
+        // permissions policy, so treat it as best-effort.
+        await navigator.clipboard.writeText(text);
+        ok = true;
+    } catch (e) {
+        // Legacy path: works without clipboard permissions.
+        try {
+            const ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.opacity = '0';
+            document.body.appendChild(ta);
+            ta.select();
+            ok = document.execCommand('copy');
+            document.body.removeChild(ta);
+        } catch (e2) { ok = false; }
+    }
+
+    if (ok) {
+        btn.textContent = '✅ Скопировано';
+    } else {
+        // Last resort: reveal the log so it can be selected manually.
+        document.getElementById('logBox').classList.remove('hidden');
+        document.getElementById('logBox').open = true;
+        btn.textContent = '⚠️ Скопируйте вручную';
+    }
+    setTimeout(() => { btn.textContent = '📋 Копировать лог'; }, 2000);
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    const btn = document.getElementById('copyLog');
+    if (btn) btn.addEventListener('click', copyRunLog);
+});

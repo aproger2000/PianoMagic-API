@@ -559,3 +559,75 @@ footer {
         grid-template-columns: 1fr;
     }
 }
+
+/* ── Engine banner & run log (v7.6.1) ───────────────────────── */
+/* Which engine produced a result, and the full run log, shown in the
+   page itself: a silent fallback to the monophonic engine used to be
+   indistinguishable from a healthy run. */
+.engine-banner {
+    margin-top: 12px;
+    padding: 10px 14px;
+    border-radius: 8px;
+    font-size: 0.9rem;
+    font-weight: 600;
+}
+
+.engine-banner.engine-ok {
+    background: #e8f5e9;
+    color: #1b5e20;
+    border: 1px solid #a5d6a7;
+}
+
+.engine-banner.engine-warn {
+    background: #fff4e5;
+    color: #7a4100;
+    border: 1px solid #ffb74d;
+}
+
+.log-box {
+    margin-top: 12px;
+    background: #fafafa;
+    border: 1px solid #e0e0e0;
+    border-radius: 8px;
+    padding: 10px 14px;
+    font-size: 0.85rem;
+}
+
+.log-box > summary {
+    cursor: pointer;
+    font-weight: 600;
+    color: #555;
+    user-select: none;
+}
+
+.log-box pre {
+    margin: 10px 0 0;
+    max-height: 340px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 0.78rem;
+    line-height: 1.45;
+    color: #333;
+}
+
+#copyLog {
+    cursor: pointer;
+    font: inherit;
+}
+
+.diagnostics-section {
+    background: #fff;
+    border-radius: 12px;
+    padding: 18px 22px;
+    margin-top: 20px;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.06);
+}
+
+.diagnostics-actions {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-top: 12px;
+}

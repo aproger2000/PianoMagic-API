@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PianoMagic v7.6.0 — Audio to Piano Score</title>
+    <title>PianoMagic v7.6.1 — Audio to Piano Score</title>
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -11,7 +11,7 @@
         <header>
             <h1>🎹 PianoMagic</h1>
             <p class="subtitle">Audio → Piano Score Transcription</p>
-            <span class="version-badge">v7.6.0</span>
+            <span class="version-badge">v7.6.1</span>
         </header>
 
         <div class="upload-section" id="uploadSection">
@@ -132,10 +132,24 @@
             </div>
         </div>
 
+        <!-- Diagnostics live outside the results block on purpose: a run
+             that fails never shows results, and that is exactly when the
+             log needs to be reachable. -->
+        <div class="diagnostics-section hidden" id="diagnosticsSection">
+            <div id="engineBanner" class="engine-banner hidden"></div>
+            <div class="diagnostics-actions">
+                <button id="copyLog" class="btn-download" type="button">📋 Копировать лог</button>
+            </div>
+            <details id="logBox" class="log-box hidden">
+                <summary>Лог обработки</summary>
+                <pre id="logText"></pre>
+            </details>
+        </div>
+
         <footer>
             <div class="footer-content">
                 <div class="footer-left">
-                    <span class="footer-version">Frontend: <strong id="feVersion">v7.2.1</strong></span>
+                    <span class="footer-version">Frontend: <strong id="feVersion">v7.6.1</strong></span>
                     <span class="footer-separator">|</span>
                     <span class="footer-version">Backend: <strong id="beVersion">—</strong></span>
                 </div>
