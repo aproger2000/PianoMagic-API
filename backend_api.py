@@ -1,5 +1,5 @@
 """
-PianoMagic Backend API — v7.4.1
+PianoMagic Backend API — v7.4.2
 Audio-to-piano-score transcription
 """
 
@@ -28,7 +28,7 @@ from scipy.ndimage import median_filter
 # ───────────────────────────────────────────────────────────────
 # Configuration
 # ───────────────────────────────────────────────────────────────
-VERSION = "7.4.1"
+VERSION = "7.4.2"
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "pianomagic_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 print(f"[INIT] UPLOAD_DIR={UPLOAD_DIR}, exists={UPLOAD_DIR.exists()}")
@@ -100,7 +100,7 @@ def estimate_key(chroma: np.ndarray) -> str:
     return max(correlations, key=correlations.get)
 
 # ───────────────────────────────────────────────────────────────
-# Core Algorithm: v7.4.1
+# Core Algorithm: v7.4.2
 # ───────────────────────────────────────────────────────────────
 def smooth_pitch(voice: np.ndarray, window: int = 7) -> np.ndarray:
     """Median filter to remove vibrato artifacts."""
@@ -460,7 +460,40 @@ def synthesize_piano_v72(notes: List[Note], sr: int = 22050, duration: float = N
 # ───────────────────────────────────────────────────────────────
 # MusicXML
 # ───────────────────────────────────────────────────────────────
+def _duration_divs_to_type(dur_divs: int) -> str:
+    if dur_divs >= 16:
+        return 'whole'
+    elif dur_divs >= 8:
+        return 'half'
+    elif dur_divs >= 4:
+        return 'quarter'
+    elif dur_divs >= 2:
+        return 'eighth'
+    else:
+        return '16th'
+
 def generate_musicxml_v72(result: TranscriptionResult, title: str = "PianoMagic Transcription") -> str:
+    """
+    v7.4.2: fixed two structural bugs that made every export unreadable
+    as real sheet music, independent of how good the underlying note
+    detection is:
+
+    1. Every note ended up inside a single <measure number="1">. The old
+       loop tracked a `current_measure` counter correctly but only ever
+       created a new <measure> element for the very first note (the
+       `measure is None` branch) - the "start a new measure" condition
+       right after it could never be true because the preceding `while`
+       loop had already advanced measure_start past every note that
+       would trigger it. Every subsequent note landed inside measure 1.
+
+    2. RH and LH notes were interleaved into ONE forward-only timeline
+       with no <backup> between them. MusicXML requires an explicit
+       <backup> to rewind the time cursor when moving from one voice/
+       staff to another in the same measure; without it, a reader has
+       no way to know the two hands play *simultaneously* rather than
+       one after another, so the two staves come out as a single
+       garbled sequential line instead of a real two-handed score.
+    """
     score = Element('score-partwise', version='3.1')
 
     work = SubElement(score, 'work')
@@ -483,11 +516,12 @@ def generate_musicxml_v72(result: TranscriptionResult, title: str = "PianoMagic 
     part = SubElement(score, 'part', id='P1')
 
     beats_per_measure = 4
+    divisions = 4
+    divisions_per_measure = beats_per_measure * divisions
     seconds_per_beat = 60.0 / result.tempo
     measure_duration = beats_per_measure * seconds_per_beat
 
     notes_sorted = sorted(result.notes, key=lambda n: n.start)
-    divisions = 4
 
     if not notes_sorted:
         measure = SubElement(part, 'measure', number='1')
@@ -512,80 +546,103 @@ def generate_musicxml_v72(result: TranscriptionResult, title: str = "PianoMagic 
         SubElement(note_el, 'type').text = 'whole'
         SubElement(note_el, 'staff').text = '1'
     else:
-        current_measure = 1
-        measure_start = 0.0
-        measure = None
-        attr_set = False
+        rh_notes = [n for n in notes_sorted if n.hand == 'RH']
+        lh_notes = [n for n in notes_sorted if n.hand != 'RH']
 
-        for note in notes_sorted:
-            while note.start >= measure_start + measure_duration:
-                current_measure += 1
-                measure_start += measure_duration
-                attr_set = False
+        last_end = max(n.end for n in notes_sorted)
+        total_measures = min(2000, max(1, int(last_end / measure_duration) + 1))
 
-            if measure is None or note.start >= measure_start + measure_duration:
-                measure = SubElement(part, 'measure', number=str(current_measure))
+        def emit_voice(measure_el, voice_notes, measure_start, staff_num, voice_num):
+            """Write one voice's notes/rests for this measure, padding
+            gaps with rests so the voice always sums to exactly
+            divisions_per_measure - that's what makes the fixed-size
+            <backup> below correct for realigning to the other voice."""
+            cursor = 0
+            for note in voice_notes:
+                start_divs = int(round((note.start - measure_start) / seconds_per_beat * divisions))
+                start_divs = max(0, min(start_divs, divisions_per_measure))
+                end_divs = int(round((note.end - measure_start) / seconds_per_beat * divisions))
+                end_divs = max(start_divs + 1, min(end_divs, divisions_per_measure))
 
-                if not attr_set:
-                    attr = SubElement(measure, 'attributes')
-                    SubElement(attr, 'divisions').text = str(divisions)
+                if start_divs > cursor:
+                    gap = start_divs - cursor
+                    rest_el = SubElement(measure_el, 'note')
+                    SubElement(rest_el, 'rest')
+                    SubElement(rest_el, 'duration').text = str(gap)
+                    SubElement(rest_el, 'voice').text = str(voice_num)
+                    SubElement(rest_el, 'staff').text = str(staff_num)
+                    cursor += gap
+                elif start_divs < cursor:
+                    # overlaps the previous note in this voice (quantization
+                    # rounding, or two notes merged very close together) -
+                    # never move the cursor backwards within one voice
+                    start_divs = cursor
 
-                    if current_measure == 1:
-                        time = SubElement(attr, 'time')
-                        SubElement(time, 'beats').text = '4'
-                        SubElement(time, 'beat-type').text = '4'
+                dur_divs = min(max(1, end_divs - start_divs), divisions_per_measure - cursor)
+                if dur_divs <= 0:
+                    continue
 
-                        key = SubElement(attr, 'key')
-                        SubElement(key, 'fifths').text = '0'
+                note_el = SubElement(measure_el, 'note')
+                step, alter, octave = midi_to_ly_step(note.pitch_midi)
+                pitch_el = SubElement(note_el, 'pitch')
+                SubElement(pitch_el, 'step').text = step
+                if alter != 0:
+                    SubElement(pitch_el, 'alter').text = str(alter)
+                SubElement(pitch_el, 'octave').text = str(octave)
+                SubElement(note_el, 'duration').text = str(dur_divs)
+                SubElement(note_el, 'type').text = _duration_divs_to_type(dur_divs)
+                SubElement(note_el, 'staff').text = str(staff_num)
+                SubElement(note_el, 'voice').text = str(voice_num)
+                cursor += dur_divs
 
-                        SubElement(attr, 'staves').text = '2'
+            if cursor < divisions_per_measure:
+                rest_el = SubElement(measure_el, 'note')
+                SubElement(rest_el, 'rest')
+                SubElement(rest_el, 'duration').text = str(divisions_per_measure - cursor)
+                SubElement(rest_el, 'voice').text = str(voice_num)
+                SubElement(rest_el, 'staff').text = str(staff_num)
 
-                        clef1 = SubElement(attr, 'clef', number='1')
-                        SubElement(clef1, 'sign').text = 'G'
-                        SubElement(clef1, 'line').text = '2'
+        for m in range(total_measures):
+            measure_start = m * measure_duration
+            measure_end = measure_start + measure_duration
+            measure = SubElement(part, 'measure', number=str(m + 1))
 
-                        clef2 = SubElement(attr, 'clef', number='2')
-                        SubElement(clef2, 'sign').text = 'F'
-                        SubElement(clef2, 'line').text = '4'
+            if m == 0:
+                attr = SubElement(measure, 'attributes')
+                SubElement(attr, 'divisions').text = str(divisions)
 
-                        direction = SubElement(measure, 'direction', placement='above')
-                        dt = SubElement(direction, 'direction-type')
-                        metro = SubElement(dt, 'metronome')
-                        SubElement(metro, 'beat-unit').text = 'quarter'
-                        SubElement(metro, 'per-minute').text = str(int(result.tempo))
+                time = SubElement(attr, 'time')
+                SubElement(time, 'beats').text = '4'
+                SubElement(time, 'beat-type').text = '4'
 
-                    attr_set = True
+                key = SubElement(attr, 'key')
+                SubElement(key, 'fifths').text = '0'
 
-            note_dur = note.end - note.start
-            dur_divs = max(1, int(round(note_dur / seconds_per_beat * divisions)))
+                SubElement(attr, 'staves').text = '2'
 
-            note_el = SubElement(measure, 'note')
-            staff_num = '1' if note.hand == 'RH' else '2'
+                clef1 = SubElement(attr, 'clef', number='1')
+                SubElement(clef1, 'sign').text = 'G'
+                SubElement(clef1, 'line').text = '2'
 
-            step, alter, octave = midi_to_ly_step(note.pitch_midi)
-            pitch_el = SubElement(note_el, 'pitch')
-            SubElement(pitch_el, 'step').text = step
-            if alter != 0:
-                SubElement(pitch_el, 'alter').text = str(alter)
-            SubElement(pitch_el, 'octave').text = str(octave)
+                clef2 = SubElement(attr, 'clef', number='2')
+                SubElement(clef2, 'sign').text = 'F'
+                SubElement(clef2, 'line').text = '4'
 
-            SubElement(note_el, 'duration').text = str(dur_divs)
+                direction = SubElement(measure, 'direction', placement='above')
+                dt = SubElement(direction, 'direction-type')
+                metro = SubElement(dt, 'metronome')
+                SubElement(metro, 'beat-unit').text = 'quarter'
+                SubElement(metro, 'per-minute').text = str(int(result.tempo))
 
-            type_name = 'quarter'
-            if dur_divs >= 16:
-                type_name = 'whole'
-            elif dur_divs >= 8:
-                type_name = 'half'
-            elif dur_divs >= 4:
-                type_name = 'quarter'
-            elif dur_divs >= 2:
-                type_name = 'eighth'
-            else:
-                type_name = '16th'
+            rh_in_measure = [n for n in rh_notes if measure_start <= n.start < measure_end]
+            lh_in_measure = [n for n in lh_notes if measure_start <= n.start < measure_end]
 
-            SubElement(note_el, 'type').text = type_name
-            SubElement(note_el, 'staff').text = staff_num
-            SubElement(note_el, 'voice').text = staff_num
+            emit_voice(measure, rh_in_measure, measure_start, staff_num=1, voice_num=1)
+
+            backup_el = SubElement(measure, 'backup')
+            SubElement(backup_el, 'duration').text = str(divisions_per_measure)
+
+            emit_voice(measure, lh_in_measure, measure_start, staff_num=2, voice_num=2)
 
     rough = tostring(score, encoding='unicode')
     reparsed = minidom.parseString(rough)
