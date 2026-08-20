@@ -1,5 +1,5 @@
 """
-PianoMagic Backend API — v7.6.1
+PianoMagic Backend API — v7.6.2
 Audio-to-piano-score transcription
 """
 
@@ -42,8 +42,12 @@ _BASIC_PITCH_IMPORT_ERROR = None
 # runtime failure is now recorded here and surfaced on /version and on the
 # task result, so a silent fallback can't masquerade as a working engine.
 LAST_ENGINE_ERROR = None
+_BP_MODEL = None            # cached loaded model (loading it is not cheap)
+_BP_MODEL_PATH_USED = None  # which serialized graph actually loaded
+_BP_MODEL_LOAD_ERROR = None
+_BP_MODEL_CANDIDATES = []
 try:
-    from basic_pitch.inference import predict as _bp_predict
+    from basic_pitch.inference import predict as _bp_predict, Model as _BPModel
     from basic_pitch import ICASSP_2022_MODEL_PATH as _BP_MODEL_PATH
     BASIC_PITCH_AVAILABLE = True
     print("[INIT] basic-pitch available - using neural polyphonic transcription")
@@ -51,10 +55,93 @@ except Exception as _e:  # ImportError, or a backend/runtime that failed to load
     _BASIC_PITCH_IMPORT_ERROR = repr(_e)
     print(f"[INIT] basic-pitch NOT available ({_e!r}) - falling back to librosa PYIN")
 
+
+def _bp_model_candidates() -> list:
+    """
+    v7.6.2: choose the serialized model ourselves instead of taking
+    basic-pitch's ICASSP_2022_MODEL_PATH at face value.
+
+    basic-pitch picks a graph by runtime priority TF > CoreML > TFLite >
+    ONNX. This image has BOTH tflite-runtime and onnxruntime installed
+    (tflite-runtime arrives as a default dependency on Linux), so it
+    selected nmp.tflite - and that graph then refused to load:
+
+        ValueError: File .../nmp.tflite cannot be loaded into either
+        TensorFlow, CoreML, TFLite or ONNX. On this system,
+        ['TensorFlowLite', 'ONNX'] is installed.
+
+    tflite-runtime 2.14 predates NumPy 2.x, which this image has (2.2.6),
+    so its interpreter can't initialise. Because the selection happens
+    before any load is attempted, basic-pitch never fell through to the
+    ONNX graph that would have worked, and every request died there.
+
+    Preferring ONNX explicitly - and then actually trying each candidate
+    until one loads - makes the choice depend on what works rather than
+    on which packages merely happen to be importable.
+    """
+    out, seen = [], set()
+
+    def add(p):
+        if p is None:
+            return
+        s = str(p)
+        if s not in seen:
+            seen.add(s)
+            out.append(p)
+
+    try:
+        from basic_pitch import build_icassp_2022_model_path, FilenameSuffix
+        # onnx first: onnxruntime is the runtime we install and verify.
+        for name in ("onnx", "tf", "tflite", "coreml"):
+            suffix = getattr(FilenameSuffix, name, None)
+            if suffix is None:
+                continue
+            try:
+                add(build_icassp_2022_model_path(suffix))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Whatever basic-pitch itself would have used, as a last resort.
+    try:
+        add(_BP_MODEL_PATH)
+    except Exception:
+        pass
+    return out
+
+
+def _get_bp_model():
+    """Load (once) the first candidate graph that actually initialises."""
+    global _BP_MODEL, _BP_MODEL_PATH_USED, _BP_MODEL_LOAD_ERROR, _BP_MODEL_CANDIDATES
+    if _BP_MODEL is not None:
+        return _BP_MODEL
+
+    _BP_MODEL_CANDIDATES = _bp_model_candidates()
+    attempts = []
+    for path in _BP_MODEL_CANDIDATES:
+        if not Path(str(path)).exists():
+            attempts.append(f"  {path} -> not present in the installed package")
+            continue
+        try:
+            model = _BPModel(path)
+        except Exception as e:
+            attempts.append(f"  {path} -> {e!r}")
+            continue
+        _BP_MODEL = model
+        _BP_MODEL_PATH_USED = str(path)
+        _BP_MODEL_LOAD_ERROR = None
+        print(f"[INIT] basic-pitch model loaded: {path}")
+        return _BP_MODEL
+
+    _BP_MODEL_LOAD_ERROR = ("No basic-pitch model graph could be loaded.\n"
+                            + "\n".join(attempts))
+    raise RuntimeError(_BP_MODEL_LOAD_ERROR)
+
 # ───────────────────────────────────────────────────────────────
 # Configuration
 # ───────────────────────────────────────────────────────────────
-VERSION = "7.6.1"
+VERSION = "7.6.2"
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "pianomagic_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 print(f"[INIT] UPLOAD_DIR={UPLOAD_DIR}, exists={UPLOAD_DIR.exists()}")
@@ -84,17 +171,39 @@ def _env_report() -> List[str]:
                 "tensorflow", "tflite_runtime"):
         try:
             m = __import__(mod)
-            lines.append(f"{mod:<24}: {getattr(m, '__version__', 'unknown')}")
+            ver = getattr(m, '__version__', None)
+            if ver is None:
+                # basic_pitch exposes no __version__; ask the package metadata
+                # instead of reporting a useless "unknown".
+                try:
+                    from importlib.metadata import version as _pkgver
+                    ver = _pkgver(mod.replace('_', '-'))
+                except Exception:
+                    ver = 'installed (version unknown)'
+            lines.append(f"{mod:<24}: {ver}")
         except Exception:
             lines.append(f"{mod:<24}: NOT INSTALLED")
     lines.append(f"basic-pitch importable  : {BASIC_PITCH_AVAILABLE}")
     if _BASIC_PITCH_IMPORT_ERROR:
         lines.append(f"basic-pitch import error: {_BASIC_PITCH_IMPORT_ERROR}")
     if BASIC_PITCH_AVAILABLE:
+        # Which graphs actually ship in this install, and which one we
+        # selected. When the engine falls over, this is the difference
+        # between "the model file isn't there" and "the runtime can't
+        # read it" - two problems with completely different fixes.
         try:
-            lines.append(f"basic-pitch model path  : {_BP_MODEL_PATH}")
+            lines.append(f"basic-pitch default path: {_BP_MODEL_PATH}")
         except Exception:
             pass
+        try:
+            for cand in (_BP_MODEL_CANDIDATES or _bp_model_candidates()):
+                mark = "present" if Path(str(cand)).exists() else "MISSING"
+                lines.append(f"  candidate [{mark:<7}]   : {cand}")
+        except Exception:
+            pass
+        lines.append(f"model loaded from       : {_BP_MODEL_PATH_USED or '(not loaded yet)'}")
+        if _BP_MODEL_LOAD_ERROR:
+            lines.append(f"model load error        : {_BP_MODEL_LOAD_ERROR}")
     return lines
 
 class _TeeLog:
@@ -483,13 +592,18 @@ def extract_melody_basic_pitch(file_path, y: np.ndarray, sr: int) -> Transcripti
     # already cleared - librosa decoded this same file moments ago in
     # process_audio. 22050 Hz mono is exactly what the model consumes
     # internally, so this also skips a redundant resample.
+    # Load the model before writing anything, so a model problem is
+    # reported as a model problem rather than after a pile of I/O.
+    model = _get_bp_model()
+    print(f"[EXTRACT] Basic Pitch model: {_BP_MODEL_PATH_USED}")
+
     tmp_wav = UPLOAD_DIR / f"_bp_input_{uuid.uuid4().hex}.wav"
     try:
         sf.write(str(tmp_wav), y, sr, subtype='PCM_16')
         print(f"[EXTRACT] Running Basic Pitch on {tmp_wav.name} ({duration:.1f}s)...")
         _model_out, _midi, note_events = _bp_predict(
             str(tmp_wav),
-            _BP_MODEL_PATH,
+            model,
             # A0-C7: the practical piano range. Bounding it keeps sub-bass
             # rumble and cymbal-region artefacts out of the note list.
             minimum_frequency=float(librosa.note_to_hz('A0')),

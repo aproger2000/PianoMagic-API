@@ -12,6 +12,17 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
+# basic-pitch pulls tflite-runtime as a default Linux dependency, and then
+# prefers it over ONNX when choosing which model graph to load. The pinned
+# tflite-runtime (2.14) predates NumPy 2.x, which this image installs, so
+# its interpreter cannot initialise and the chosen .tflite graph fails with
+# "cannot be loaded into either TensorFlow, CoreML, TFLite or ONNX" - which
+# is what made every v7.6.0/v7.6.1 request fall back to the old monophonic
+# engine. The backend now picks the ONNX graph explicitly, but dropping the
+# unusable runtime also repairs basic-pitch's own default selection so the
+# two can't disagree. Guarded so the build still succeeds if it is absent.
+RUN pip uninstall -y tflite-runtime || true
+
 COPY backend_api.py .
 
 ENV QT_QPA_PLATFORM=offscreen
