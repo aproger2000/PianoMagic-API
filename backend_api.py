@@ -1,5 +1,5 @@
 """
-PianoMagic Backend API — v7.6.2
+PianoMagic Backend API — v7.6.3
 Audio-to-piano-score transcription
 """
 
@@ -141,7 +141,7 @@ def _get_bp_model():
 # ───────────────────────────────────────────────────────────────
 # Configuration
 # ───────────────────────────────────────────────────────────────
-VERSION = "7.6.2"
+VERSION = "7.6.3"
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "pianomagic_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 print(f"[INIT] UPLOAD_DIR={UPLOAD_DIR}, exists={UPLOAD_DIR.exists()}")
@@ -462,6 +462,71 @@ def _two_means_split_midi(midi_vals: np.ndarray, fallback: int = 60) -> int:
     lo, hi = sorted([c1, c2])
     return max(48, min(72, int(round((lo + hi) / 2))))
 
+def _select_line(cands, jump_weight: float = 0.06, phrase_gap: float = 0.55,
+                 pitch_bias: float = 0.0, dur_cap: float = 1.0):
+    """
+    Pick ONE monophonic line out of overlapping note candidates, by
+    choosing the non-overlapping chain that maximises
+
+        sum(salience) - sum(pitch-jump penalties)
+
+    v7.6.3. The previous reduction just took the highest sounding pitch
+    as the right hand and the lowest as the left. On real polyphonic
+    audio that fails badly, because Basic Pitch also reports overtones
+    and cymbal/consonant artefacts as notes: whenever one of those
+    outranks the tune for an instant, the "top line" jumps to it and
+    back. Measured on the v7.6.2 output, the right hand spanned 49
+    semitones and 27% of consecutive intervals were an octave or more -
+    no melody moves like that, and it is what still made the result
+    sound wrong after the engine itself was fixed.
+
+    Salience (loudness x duration) says which notes are really being
+    played; the jump penalty says a melody moves in small steps. A note
+    only wins the line if it is worth the distance travelled to reach
+    it, so a loud sustained tune beats a swarm of brief overtones
+    sitting above it. Penalties are dropped across gaps longer than
+    phrase_gap - a genuine rest between phrases should not force the
+    next phrase to start near where the last one ended.
+
+    Exact optimum via dynamic programming over notes ordered by onset;
+    O(n^2) on a few hundred candidates per voice.
+    """
+    if not cands:
+        return []
+
+    cands = sorted(cands, key=lambda e: (e[0], e[1]))
+    n = len(cands)
+    amax = max((c[3] for c in cands), default=1.0) or 1.0
+
+    # Salience in a fixed [0, ~1] range so one jump_weight works
+    # regardless of how the model scales its amplitudes.
+    sal = []
+    for (s, e, p, a) in cands:
+        sal.append((a / amax) * min(e - s, dur_cap) / dur_cap + pitch_bias * p)
+
+    best = list(sal)
+    prev = [-1] * n
+    for i in range(n):
+        si, _ei, pi, _ai = cands[i]
+        bi, pv = best[i], -1
+        for j in range(i):
+            _sj, ej, pj, _aj = cands[j]
+            if ej > si + 1e-9:
+                continue  # overlaps: a single voice can't hold both
+            pen = 0.0 if (si - ej) > phrase_gap else jump_weight * min(abs(pi - pj), 24)
+            val = best[j] + sal[i] - pen
+            if val > bi:
+                bi, pv = val, j
+        best[i], prev[i] = bi, pv
+
+    k = max(range(n), key=lambda i: best[i])
+    out = []
+    while k != -1:
+        out.append(cands[k])
+        k = prev[k]
+    return list(reversed(out))
+
+
 def _reduce_polyphony_to_two_voices(note_events, min_dur_ms: float = 80.0,
                                     amp_frac_of_peak: float = 0.10):
     """
@@ -469,98 +534,76 @@ def _reduce_polyphony_to_two_voices(note_events, min_dur_ms: float = 80.0,
     monophonic voices a two-staff piano score can actually represent.
 
     Basic Pitch returns EVERY note it hears - on a full arrangement
-    (vocal + accompaniment + percussion) that's hundreds of overlapping
-    events spanning the whole keyboard. Two things force a reduction:
-    musically, a dump of every detected partial is unreadable as sheet
-    music; mechanically, generate_musicxml_v72's emit_voice() walks a
-    single forward-only cursor per voice, so it cannot represent two
-    notes overlapping *within* one voice at all.
+    that's well over a thousand overlapping events spanning the whole
+    keyboard. Two things force a reduction: musically, a dump of every
+    detected partial is unreadable as sheet music; mechanically,
+    generate_musicxml_v72's emit_voice() walks a single forward-only
+    cursor per voice, so it cannot represent two notes overlapping
+    *within* one voice at all.
 
-    So we take the standard melody/bass skeleton: on a fine time grid,
-    the top sounding pitch becomes the right hand and the bottom
-    sounding pitch becomes the left hand. That's the reduction a person
-    arranging a song for piano would start from, and it's what makes the
-    result recognisable as the tune rather than as a cloud of notes.
-
-    Quiet detections are dropped first, since those are mostly percussion
-    smear and reverb tails rather than real notes. The threshold is a
-    fraction of the LOUDEST detection, deliberately not a percentile of
-    the amplitude distribution: percussion-heavy input can produce more
-    spurious notes than real ones, and a percentile gate silently moves
-    with them, so the junk survives its own gate. That failure mode is
-    especially damaging here because the right hand is taken as the top
-    sounding pitch - a swarm of weak high-register artefacts would
-    become "the melody" and reproduce exactly the noise this engine is
-    meant to eliminate. A peak-relative floor can't drift that way.
+    So we take the standard melody/bass skeleton - but choose each line
+    by salience and continuity (see _select_line) rather than by taking
+    the extreme pitch at each instant.
     """
     if not note_events:
         return []
 
-    amps = np.array([ev[3] for ev in note_events], dtype=float)
+    events = [(float(ev[0]), float(ev[1]), int(ev[2]), float(ev[3]))
+              for ev in note_events if ev[1] > ev[0]]
+    if not events:
+        return []
+
+    amps = np.array([e[3] for e in events], dtype=float)
     amp_peak = float(amps.max()) if len(amps) else 0.0
-    amp_floor = amp_frac_of_peak * amp_peak
-    events = [ev for ev in note_events if ev[3] >= amp_floor and ev[1] > ev[0]]
-    if not events:
-        events = [ev for ev in note_events if ev[1] > ev[0]]
-    if not events:
-        return []
+    kept = [e for e in events if e[3] >= amp_frac_of_peak * amp_peak]
+    if kept:
+        events = kept
+    # Report the amplitude spread too: on the v7.6.2 run this gate removed
+    # 0 of 1658 events, i.e. it was doing nothing and the real filtering
+    # has to come from line selection, not from a loudness threshold.
+    print(f"[EXTRACT] amplitude: peak={amp_peak:.3f} min={amps.min():.3f} "
+          f"median={float(np.median(amps)):.3f}; kept {len(events)}/{len(amps)} "
+          f"above {amp_frac_of_peak:.0%} of peak")
 
-    pitches = np.array([ev[2] for ev in events], dtype=float)
-    split_midi = _two_means_split_midi(pitches)
-    print(f"[EXTRACT] basic-pitch: {len(note_events)} raw events, {len(events)} after "
-          f"amplitude gate, RH/LH split at MIDI {split_midi}")
+    # Weight the RH/LH boundary by salience rather than counting every
+    # detection equally. A cloud of brief artefacts can easily outnumber
+    # the notes actually being played, and one-note-one-vote lets it drag
+    # the boundary up into the middle of the melody - which then splits
+    # the tune across both staves. Loudness x duration makes the notes a
+    # listener would call "the music" decide where the hands divide.
+    pitches = np.array([e[2] for e in events], dtype=float)
+    weights = np.array([(e[1] - e[0]) * e[3] for e in events], dtype=float)
+    if weights.max() > 0:
+        reps = np.clip(np.round(weights / (weights.max() / 6.0)), 1, 6).astype(int)
+        split_midi = _two_means_split_midi(np.repeat(pitches, reps))
+    else:
+        split_midi = _two_means_split_midi(pitches)
 
-    grid = 0.01  # 10 ms
-    t_end = max(ev[1] for ev in events)
-    n_frames = int(np.ceil(t_end / grid)) + 1
-    if n_frames <= 0 or n_frames > 2_000_000:
-        return []
+    min_dur = min_dur_ms / 1000.0
+    upper = [e for e in events if e[2] >= split_midi and (e[1] - e[0]) >= min_dur]
+    lower = [e for e in events if e[2] < split_midi and (e[1] - e[0]) >= min_dur]
+    print(f"[EXTRACT] split at MIDI {split_midi}: {len(upper)} upper / {len(lower)} lower candidates")
 
-    top = np.full(n_frames, -1, dtype=int)
-    bottom = np.full(n_frames, -1, dtype=int)
+    # Melody: no pitch bias - loudness and smoothness decide, so the line
+    # follows what is actually played rather than whatever sits highest.
+    # Bass: a small downward bias, because the bass line genuinely is the
+    # bottom of the texture even when an inner voice is louder.
+    mel = _select_line(upper, pitch_bias=0.0)
+    bass = _select_line(lower, pitch_bias=-0.004)
 
-    for start, end, pitch, _amp, *_rest in events:
-        i0 = max(0, int(np.floor(start / grid)))
-        i1 = min(n_frames, int(np.ceil(end / grid)))
-        if i1 <= i0:
-            continue
-        seg_top = top[i0:i1]
-        seg_bot = bottom[i0:i1]
-        np.maximum(seg_top, pitch, out=seg_top)
-        empty = seg_bot < 0
-        seg_bot[empty] = pitch
-        np.minimum(seg_bot, pitch, out=seg_bot)
+    rh = [Note(start=s, end=e, pitch_midi=p, hand="RH") for (s, e, p, _a) in mel]
+    lh = [Note(start=s, end=e, pitch_midi=p, hand="LH") for (s, e, p, _a) in bass]
 
-    # Where only ONE pitch sounds, top == bottom. Give that note to the
-    # hand its register belongs to rather than duplicating it on both
-    # staves (which would read as a phantom unison).
-    same = (top == bottom) & (top >= 0)
-    rh_line = top.copy()
-    lh_line = bottom.copy()
-    rh_line[same & (top < split_midi)] = -1
-    lh_line[same & (top >= split_midi)] = -1
+    def _spread(v):
+        if len(v) < 2:
+            return "n/a"
+        ps = [x.pitch_midi for x in v]
+        jumps = [abs(b - a) for a, b in zip(ps, ps[1:])]
+        big = 100.0 * sum(1 for j in jumps if j >= 12) / len(jumps)
+        return f"range {min(ps)}-{max(ps)} st, {big:.0f}% octave+ leaps"
 
-    def runs_to_notes(line, hand):
-        notes = []
-        i = 0
-        n = len(line)
-        while i < n:
-            if line[i] < 0:
-                i += 1
-                continue
-            j = i
-            while j < n and line[j] == line[i]:
-                j += 1
-            dur_ms = (j - i) * grid * 1000
-            if dur_ms >= min_dur_ms:
-                notes.append(Note(start=i * grid, end=j * grid,
-                                  pitch_midi=int(line[i]), hand=hand))
-            i = j
-        return notes
-
-    rh = runs_to_notes(rh_line, "RH")
-    lh = runs_to_notes(lh_line, "LH")
-    print(f"[EXTRACT] basic-pitch reduction: RH={len(rh)} notes, LH={len(lh)} notes")
+    print(f"[EXTRACT] line selection: RH={len(rh)} notes ({_spread(rh)}), "
+          f"LH={len(lh)} notes ({_spread(lh)})")
     return sorted(rh + lh, key=lambda n: n.start)
 
 def extract_melody_basic_pitch(file_path, y: np.ndarray, sr: int) -> TranscriptionResult:
