@@ -1,5 +1,5 @@
 """
-PianoMagic Backend API — v7.6.3
+PianoMagic Backend API — v7.6.4
 Audio-to-piano-score transcription
 """
 
@@ -141,7 +141,7 @@ def _get_bp_model():
 # ───────────────────────────────────────────────────────────────
 # Configuration
 # ───────────────────────────────────────────────────────────────
-VERSION = "7.6.3"
+VERSION = "7.6.4"
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "pianomagic_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 print(f"[INIT] UPLOAD_DIR={UPLOAD_DIR}, exists={UPLOAD_DIR.exists()}")
@@ -662,7 +662,20 @@ def extract_melody_basic_pitch(file_path, y: np.ndarray, sr: int) -> Transcripti
     print(f"[EXTRACT] Basic Pitch returned {len(note_events)} note events")
 
     notes = _reduce_polyphony_to_two_voices(note_events)
-    notes = merge_close_notes(notes, max_gap_ms=90, max_pitch_diff_st=0.0)
+    # v7.6.4: 25 ms, not 90 ms. merge_close_notes exists for the PYIN path,
+    # where a continuous pitch contour gets chopped into many same-pitch
+    # fragments by frame-level noise and genuinely needs stitching back.
+    # Basic Pitch is different: it detects onsets and emits one event per
+    # attack, so two adjacent same-pitch events are two real repeated
+    # notes. At 90 ms this merged them - a phrase sung on one repeated
+    # pitch ("в-тра-ве-си-дел") collapsed into a single held note, which
+    # measured as a 43% loss of notes on a test phrase and matches the
+    # ~46% of right-hand notes that disappeared between selection and the
+    # score in the v7.6.3 run. Right pitches, destroyed rhythm - exactly
+    # the "part of the melody is missing" symptom. 25 ms is far below any
+    # musical repetition, so it still stitches a split detection without
+    # ever swallowing a real repeated note.
+    notes = merge_close_notes(notes, max_gap_ms=25, max_pitch_diff_st=0.0)
     notes = quantize_notes(notes)
 
     tempo, key = _estimate_tempo_and_key(y, sr)
@@ -977,17 +990,26 @@ def synthesize_piano_v72(notes: List[Note], sr: int = 22050, duration: float = N
 # ───────────────────────────────────────────────────────────────
 # MusicXML
 # ───────────────────────────────────────────────────────────────
-def _duration_divs_to_type(dur_divs: int) -> str:
-    if dur_divs >= 16:
+def _duration_divs_to_type(dur_divs: int, divisions: int = 4) -> str:
+    """Map a duration in divisions to a MusicXML note type.
+
+    Takes `divisions` rather than assuming 4, so the grid resolution can
+    change without silently relabelling every note (at divisions=8 a
+    quarter note is 8 divisions, not 4).
+    """
+    q = dur_divs / float(divisions)   # duration in quarter notes
+    if q >= 4:
         return 'whole'
-    elif dur_divs >= 8:
+    elif q >= 2:
         return 'half'
-    elif dur_divs >= 4:
+    elif q >= 1:
         return 'quarter'
-    elif dur_divs >= 2:
+    elif q >= 0.5:
         return 'eighth'
-    else:
+    elif q >= 0.25:
         return '16th'
+    else:
+        return '32nd'
 
 def generate_musicxml_v72(result: TranscriptionResult, title: str = "PianoMagic Transcription") -> str:
     """
@@ -1033,7 +1055,15 @@ def generate_musicxml_v72(result: TranscriptionResult, title: str = "PianoMagic 
     part = SubElement(score, 'part', id='P1')
 
     beats_per_measure = 4
-    divisions = 4
+    # v7.6.4: 8 divisions per quarter (32nd-note grid) rather than 4.
+    # Basic Pitch's shortest note is 90 ms; at ~99 BPM a 16th is ~150 ms,
+    # so a lot of real notes were shorter than one division and each got
+    # rounded up to the 1-division minimum. That inflates every short note
+    # and pushes the running cursor past the end of the measure, at which
+    # point emit_voice has no room left and silently drops whatever
+    # remains. A finer grid lets short notes occupy their true length
+    # instead of stealing their neighbours' space.
+    divisions = 8
     divisions_per_measure = beats_per_measure * divisions
     seconds_per_beat = 60.0 / result.tempo
     measure_duration = beats_per_measure * seconds_per_beat
@@ -1069,6 +1099,8 @@ def generate_musicxml_v72(result: TranscriptionResult, title: str = "PianoMagic 
         last_end = max(n.end for n in notes_sorted)
         total_measures = min(2000, max(1, int(last_end / measure_duration) + 1))
 
+        dropped = [0]
+
         def emit_voice(measure_el, voice_notes, measure_start, staff_num, voice_num):
             """Write one voice's notes/rests for this measure, padding
             gaps with rests so the voice always sums to exactly
@@ -1097,6 +1129,12 @@ def generate_musicxml_v72(result: TranscriptionResult, title: str = "PianoMagic 
 
                 dur_divs = min(max(1, end_divs - start_divs), divisions_per_measure - cursor)
                 if dur_divs <= 0:
+                    # No room left in this measure for this voice. Counted
+                    # and reported below rather than dropped in silence -
+                    # a note vanishing between detection and the score is
+                    # exactly the kind of loss that is invisible in the UI
+                    # and reads to the ear as "part of the melody is gone".
+                    dropped[0] += 1
                     continue
 
                 note_el = SubElement(measure_el, 'note')
@@ -1107,7 +1145,7 @@ def generate_musicxml_v72(result: TranscriptionResult, title: str = "PianoMagic 
                     SubElement(pitch_el, 'alter').text = str(alter)
                 SubElement(pitch_el, 'octave').text = str(octave)
                 SubElement(note_el, 'duration').text = str(dur_divs)
-                SubElement(note_el, 'type').text = _duration_divs_to_type(dur_divs)
+                SubElement(note_el, 'type').text = _duration_divs_to_type(dur_divs, divisions)
                 SubElement(note_el, 'staff').text = str(staff_num)
                 SubElement(note_el, 'voice').text = str(voice_num)
                 cursor += dur_divs
@@ -1160,6 +1198,12 @@ def generate_musicxml_v72(result: TranscriptionResult, title: str = "PianoMagic 
             SubElement(backup_el, 'duration').text = str(divisions_per_measure)
 
             emit_voice(measure, lh_in_measure, measure_start, staff_num=2, voice_num=2)
+
+        if dropped[0]:
+            print(f"[SCORE] WARNING: {dropped[0]} of {len(notes_sorted)} notes did not fit "
+                  f"their measure and were omitted from the score")
+        else:
+            print(f"[SCORE] all {len(notes_sorted)} notes placed, {total_measures} measures")
 
     rough = tostring(score, encoding='unicode')
     reparsed = minidom.parseString(rough)
