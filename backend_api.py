@@ -1,5 +1,5 @@
 """
-PianoMagic Backend API — v7.7.2
+PianoMagic Backend API — v7.7.3
 Audio-to-piano-score transcription
 """
 
@@ -141,7 +141,7 @@ def _get_bp_model():
 # ───────────────────────────────────────────────────────────────
 # Configuration
 # ───────────────────────────────────────────────────────────────
-VERSION = "7.7.2"
+VERSION = "7.7.3"
 
 # v7.7.0: transcribe the melody only, and leave the bass staff out.
 # The accompaniment line was contributing far more noise than music - on
@@ -652,16 +652,30 @@ def _quantize_to_beat_grid(notes: List[Note], tempo: float, subdiv: int = 4) -> 
         snapped.append(Note(start=s, end=e,
                             pitch_midi=n.pitch_midi, velocity=n.velocity, hand=n.hand))
 
+    # Two events of the same pitch landing in the same grid slot are the
+    # same note reported twice - that, and not a small gap, is what a
+    # duplicate actually looks like once the rhythm is on a grid.
+    snapped.sort(key=lambda n: (n.start, n.pitch_midi))
+    deduped, seen = [], set()
+    for n in snapped:
+        key = (round(n.start / step), n.pitch_midi)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(n)
+    n_dup = len(snapped) - len(deduped)
+
     # Snapping can push a note onto its predecessor; a single voice cannot
     # hold two notes at once, so give the earlier one the space.
-    snapped.sort(key=lambda n: (n.start, n.pitch_midi))
     out = []
-    for n in snapped:
+    for n in deduped:
         if out and n.start < out[-1].end - 1e-9:
             n.start = out[-1].end
             if n.end <= n.start:
                 n.end = n.start + step
         out.append(n)
+    if n_dup:
+        print(f"[EXTRACT] removed {n_dup} duplicate notes (same pitch, same grid slot)")
 
     after = float(_dev(np.array([n.start for n in out])).mean() / step)
     print(f"[EXTRACT] beat grid: 1/{subdiv} of a quarter at {tempo:.1f} BPM "
@@ -970,9 +984,26 @@ def extract_melody_basic_pitch(file_path, y: np.ndarray, sr: int) -> Transcripti
     # the "part of the melody is missing" symptom. 25 ms is far below any
     # musical repetition, so it still stitches a split detection without
     # ever swallowing a real repeated note.
-    notes = merge_close_notes(notes, max_gap_ms=25, max_pitch_diff_st=0.0)
-
-    # Tempo first: rhythm can only be quantised against a known beat.
+    # v7.7.3: no gap-based merging here at all.
+    #
+    # merge_close_notes belongs to the PYIN path, where one sustained note
+    # arrives as many same-pitch fragments and has to be stitched back.
+    # v7.6.4 lowered the threshold from 90 ms to 25 ms on the reasoning
+    # that 25 ms is below any musical repetition. That reasoning was
+    # wrong, and the arithmetic shows why: the gap between two repeated
+    # notes is set by how long the singer holds the first one, not by the
+    # tempo. Sung legato, two repeated eighths are separated by a few
+    # milliseconds of release - so a gap threshold of ANY size merges
+    # them. Gap is simply the wrong criterion.
+    #
+    # It cost about half the melody: 217 selected notes became 120, and
+    # the notes it destroyed were the repeated ones - which in this song
+    # is the whole opening phrase.
+    #
+    # Basic Pitch detects onsets, so two events at one pitch with separate
+    # onsets are two notes and are kept as such. Genuine duplicates are
+    # removed after quantisation instead, where "same pitch in the same
+    # grid slot" is an unambiguous test that does not depend on release.
     tempo, key = _estimate_tempo_and_key(y, sr)
     notes, grid_phase = _quantize_to_beat_grid(notes, tempo, subdiv=4)
 
