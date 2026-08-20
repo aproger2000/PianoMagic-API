@@ -1,5 +1,5 @@
 """
-PianoMagic Backend API — v7.7.3
+PianoMagic Backend API — v7.8.0
 Audio-to-piano-score transcription
 """
 
@@ -141,7 +141,7 @@ def _get_bp_model():
 # ───────────────────────────────────────────────────────────────
 # Configuration
 # ───────────────────────────────────────────────────────────────
-VERSION = "7.7.3"
+VERSION = "7.8.0"
 
 # v7.7.0: transcribe the melody only, and leave the bass staff out.
 # The accompaniment line was contributing far more noise than music - on
@@ -485,22 +485,33 @@ def _two_means_split_midi(midi_vals: np.ndarray, fallback: int = 60):
     lo, hi = sorted([c1, c2])
     return max(48, min(72, int(round((lo + hi) / 2)))), float(hi - lo)
 
-def _suppress_harmonic_partials(events, ratio: float = 0.6, factor: float = 0.45):
+def _suppress_harmonic_partials(events, ratio: float = 0.6, factor: float = 0.25,
+                                offsets=(12, 19, 24, 28, 31)):
     """
-    Damp candidates that look like an octave/twelfth partial of a lower
-    note sounding at the same time.
+    Damp candidates that look like an overtone of a lower note sounding
+    at the same time.
 
     A pitch detector reports a note's overtones as notes in their own
-    right. Those partials are what pull a melody line an octave up: they
+    right. Those partials are what pull a melody line off the tune: they
     are concurrent with the real note and just as smooth, so nothing in a
     salience-plus-continuity cost distinguishes them.
 
     The physical asymmetry is the useful part - a partial requires its
     fundamental to be sounding, but not the reverse. So a candidate with
-    a concurrent note 12, 19 or 24 semitones BELOW it, of comparable or
-    greater salience, is treated as probably that note's overtone and
-    loses weight. Nothing is deleted: a partial that is genuinely the
-    only thing there can still be chosen.
+    a concurrent note an octave, twelfth, double octave, seventeenth or
+    nineteenth BELOW it, of comparable or greater salience, is treated as
+    probably that note's overtone and loses weight. Nothing is deleted: a
+    partial that is genuinely the only thing there can still be chosen.
+
+    v7.8.0 fixes two ways this under-fired. It only ever looked at notes
+    that had *started earlier*, so a fundamental struck on the same beat
+    as its own overtone - the overwhelmingly common case, since that is
+    one note being played - was invisible unless the sort happened to put
+    it first. The test is now true interval overlap. And it stopped at
+    the 4th harmonic; measured against the source audio, the pitches this
+    transcription kept choosing were precisely those reinforced from
+    below (MIDI 70 over a 46/58 bass, 72 over 48/60, 73 over 49/61), so
+    the 5th and 6th are worth charging for too.
 
     Doing this before estimating the home register matters as much as the
     damping itself - the register estimate is a median over the selected
@@ -512,27 +523,36 @@ def _suppress_harmonic_partials(events, ratio: float = 0.6, factor: float = 0.45
 
     sal = [(e[1] - e[0]) * e[3] for e in events]
     order = sorted(range(len(events)), key=lambda i: events[i][0])
+    pos = {i: k for k, i in enumerate(order)}
     out = list(events)
+    per_offset = {o: 0 for o in offsets}
     suppressed = 0
 
-    for idx_pos, i in enumerate(order):
+    for i in range(len(events)):
         si, ei, pi, ai = events[i]
-        best_support = 0.0
-        # Only notes starting before this one can overlap it; walking
-        # backwards while starts are still within reach keeps this linear
-        # in practice rather than quadratic.
-        for j in order[max(0, idx_pos - 250):idx_pos]:
+        if sal[i] <= 0:
+            continue
+        best_support, best_off = 0.0, None
+        # Both directions: a fundamental may be sorted after its own
+        # overtone when the two start together, which is the usual case.
+        k = pos[i]
+        for j in order[max(0, k - 300):min(len(order), k + 300)]:
+            if j == i:
+                continue
             sj, ej, pj, _aj = events[j]
-            if ej <= si:
+            if ej <= si or sj >= ei:
                 continue                      # no overlap in time
-            if pi - pj in (12, 19, 24):
-                best_support = max(best_support, sal[j])
-        if best_support >= ratio * sal[i] and sal[i] > 0:
+            if (pi - pj) in per_offset and sal[j] > best_support:
+                best_support, best_off = sal[j], pi - pj
+        if best_support >= ratio * sal[i]:
             out[i] = (si, ei, pi, ai * factor)
+            per_offset[best_off] += 1
             suppressed += 1
 
+    detail = ", ".join(f"+{o}st:{c}" for o, c in sorted(per_offset.items()) if c)
     print(f"[EXTRACT] harmonic suppression: {suppressed}/{len(events)} candidates "
-          f"look like partials of a concurrent lower note")
+          f"look like partials of a concurrent lower note"
+          + (f" ({detail})" if detail else ""))
     return out
 
 
@@ -705,7 +725,8 @@ def _weighted_median(values, weights) -> float:
 
 
 def _select_line(cands, jump_weight: float = 0.06, phrase_gap: float = 0.55,
-                 pitch_bias: float = 0.0, dur_cap: float = 1.0,
+                 pitch_bias: float = 0.0, dur_cap: float = 0.30,
+                 step_free: float = 2.0, repeat_weight: float = 0.05,
                  register_center=None, register_weight: float = 0.10,
                  register_freeband: float = 7.0):
     """
@@ -746,6 +767,13 @@ def _select_line(cands, jump_weight: float = 0.06, phrase_gap: float = 0.55,
     # regardless of how the model scales its amplitudes.
     sal = []
     for (s, e, p, a) in cands:
+        # dur_cap is the length at which a note counts as fully present.
+        # It was 1.0 s, which is several times longer than any note in a
+        # sung melody: an eighth at 99 BPM scored 0.15 while a sustained
+        # accompaniment tone scored 1.0, so the search preferred held
+        # chords over the tune by a factor of six. 0.30 s is about a
+        # quarter note here, so ordinary melody notes count in full and
+        # only genuinely brief artefacts are discounted.
         v = (a / amax) * min(e - s, dur_cap) / dur_cap + pitch_bias * p
         if register_center is not None:
             # Global anchor to the line's home register. The jump penalty
@@ -784,7 +812,21 @@ def _select_line(cands, jump_weight: float = 0.06, phrase_gap: float = 0.55,
             _sj, ej, pj, _aj = cands[j]
             if ej > si + 1e-9:
                 continue  # overlaps: a single voice can't hold both
-            pen = 0.0 if (si - ej) > phrase_gap else jump_weight * min(abs(pi - pj), 24)
+            if (si - ej) > phrase_gap:
+                pen = 0.0
+            else:
+                # A melody moves by step. Charging from the first semitone
+                # made an ordinary 2nd or 3rd cost about as much as a note
+                # was worth, so the cheapest chain available was always the
+                # one that never moved - and that is exactly the piecewise
+                # constant contour the v7.7.3 output turned out to be.
+                # Steps inside a normal melodic interval are free; standing
+                # on one pitch is charged a little, so a repeated note has
+                # to be earned rather than being the default.
+                d = abs(pi - pj)
+                pen = jump_weight * min(max(0.0, d - step_free), 24)
+                if d == 0:
+                    pen += repeat_weight
             val = best[j] + sal[i] - pen
             if val > bi:
                 bi, pv = val, j
@@ -798,8 +840,8 @@ def _select_line(cands, jump_weight: float = 0.06, phrase_gap: float = 0.55,
     return list(reversed(out))
 
 
-def _reduce_polyphony_to_two_voices(note_events, min_dur_ms: float = 80.0,
-                                    amp_frac_of_peak: float = 0.10):
+def _reduce_polyphony_to_two_voices(note_events, min_dur_ms: float = 45.0,
+                                    amp_frac_of_peak: float = 0.05):
     """
     v7.6.0: turn Basic Pitch's polyphonic note list into the two
     monophonic voices a two-staff piano score can actually represent.
@@ -904,15 +946,34 @@ def _reduce_polyphony_to_two_voices(note_events, min_dur_ms: float = 80.0,
         lh = [Note(start=s, end=e, pitch_midi=p, hand="LH") for (s, e, p, _a) in bass]
 
     def _spread(v):
+        # v7.8.0 reports motion, not just range. The v7.7.3 output looked
+        # healthy by every statistic printed here - a 10-semitone range and
+        # no octave leaps - while actually being a staircase: six notes of
+        # MIDI 72, then six of 73, then 72, then 70. A tune that never moves
+        # is the specific failure this measures, so it is worth printing.
         if len(v) < 2:
             return "n/a"
         ps = [x.pitch_midi for x in v]
         jumps = [abs(b - a) for a, b in zip(ps, ps[1:])]
         big = 100.0 * sum(1 for j in jumps if j >= 12) / len(jumps)
-        return f"range {min(ps)}-{max(ps)} st, {big:.0f}% octave+ leaps"
+        still = 100.0 * sum(1 for j in jumps if j == 0) / len(jumps)
+        stepwise = 100.0 * sum(1 for j in jumps if 1 <= j <= 2) / len(jumps)
+        run = best = 1
+        for a_, b_ in zip(ps, ps[1:]):
+            run = run + 1 if a_ == b_ else 1
+            best = max(best, run)
+        return (f"range {min(ps)}-{max(ps)} st, {len(set(ps))} distinct pitches, "
+                f"{still:.0f}% repeat / {stepwise:.0f}% stepwise / {big:.0f}% octave+, "
+                f"longest run on one pitch {best}")
 
     print(f"[EXTRACT] line selection: RH={len(rh)} notes ({_spread(rh)}), "
           f"LH={len(lh)} notes ({_spread(lh)})")
+    if rh:
+        hist = {}
+        for n in rh:
+            hist[n.pitch_midi] = hist.get(n.pitch_midi, 0) + 1
+        print("[EXTRACT] melody pitch histogram: "
+              + " ".join(f"{p}x{c}" for p, c in sorted(hist.items())))
     return sorted(rh + lh, key=lambda n: n.start)
 
 def extract_melody_basic_pitch(file_path, y: np.ndarray, sr: int) -> TranscriptionResult:
@@ -960,7 +1021,17 @@ def extract_melody_basic_pitch(file_path, y: np.ndarray, sr: int) -> Transcripti
             # rumble and cymbal-region artefacts out of the note list.
             minimum_frequency=float(librosa.note_to_hz('A0')),
             maximum_frequency=float(librosa.note_to_hz('C7')),
-            minimum_note_length=90.0,
+            # v7.8.0 - "widen what the model is allowed to hear".
+            # These were left at their defaults (onset 0.5 / frame 0.3),
+            # which are tuned for clean solo instrument recordings. On a
+            # sung line inside an arrangement they discard exactly the
+            # quieter, shorter notes a listener still hears as part of
+            # the tune, which is what "several notes are missing" means.
+            # 90 ms also refuses anything shorter than a sixteenth here
+            # (a sixteenth at 99 BPM is 151 ms, a thirty-second 76 ms).
+            onset_threshold=0.35,
+            frame_threshold=0.25,
+            minimum_note_length=58.0,
             melodia_trick=True,
         )
     finally:
