@@ -1,5 +1,5 @@
 """
-PianoMagic Backend API — v7.6.5
+PianoMagic Backend API — v7.7.0
 Audio-to-piano-score transcription
 """
 
@@ -141,7 +141,16 @@ def _get_bp_model():
 # ───────────────────────────────────────────────────────────────
 # Configuration
 # ───────────────────────────────────────────────────────────────
-VERSION = "7.6.5"
+VERSION = "7.7.0"
+
+# v7.7.0: transcribe the melody only, and leave the bass staff out.
+# The accompaniment line was contributing far more noise than music - on
+# the previous run its 182 selected notes dragged the chroma similarity
+# from 0.925 down to 0.734 - and while it is there, a listener checking
+# the melody has to hear past it. Getting one voice right first is the
+# easier problem and the one that matters here. Set PIANOMAGIC_MELODY_ONLY=0
+# to bring the left hand back without touching the code.
+MELODY_ONLY = os.environ.get('PIANOMAGIC_MELODY_ONLY', '1') != '0'
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "pianomagic_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 print(f"[INIT] UPLOAD_DIR={UPLOAD_DIR}, exists={UPLOAD_DIR.exists()}")
@@ -432,18 +441,26 @@ def quantize_notes(notes: List[Note], time_grid_ms: float = 50) -> List[Note]:
             n.end = n.start + 0.12  # minimum 120ms
     return notes
 
-def _two_means_split_midi(midi_vals: np.ndarray, fallback: int = 60) -> int:
+def _two_means_split_midi(midi_vals: np.ndarray, fallback: int = 60):
     """
     Find a natural boundary between the two dominant registers present in
     a set of MIDI pitch values, via a simple 1D 2-means. Used to decide
     where this particular track's RH/LH divide sits instead of always
     assuming middle C. Clamped to C3..C6 so one odd track can't push the
     boundary somewhere that leaves a hand empty by construction.
+
+    Returns (split, separation). The separation - the gap between the two
+    cluster centres - is what says whether the split means anything:
+    2-means returns two clusters whatever it is given, including material
+    that is really one voice. Asked to divide a lone melody spanning
+    67-77, it obligingly cut it at 72 and sent the bottom half to the
+    other hand. The caller checks the separation before trusting the
+    boundary.
     """
     midi_vals = np.asarray(midi_vals, dtype=float)
     midi_vals = midi_vals[np.isfinite(midi_vals)]
     if len(midi_vals) < 40:
-        return fallback
+        return fallback, 0.0
 
     c1, c2 = np.percentile(midi_vals, 25), np.percentile(midi_vals, 75)
     for _ in range(25):
@@ -460,7 +477,7 @@ def _two_means_split_midi(midi_vals: np.ndarray, fallback: int = 60) -> int:
             break
 
     lo, hi = sorted([c1, c2])
-    return max(48, min(72, int(round((lo + hi) / 2))))
+    return max(48, min(72, int(round((lo + hi) / 2)))), float(hi - lo)
 
 def _suppress_harmonic_partials(events, ratio: float = 0.6, factor: float = 0.45):
     """
@@ -593,10 +610,15 @@ def _select_line(cands, jump_weight: float = 0.06, phrase_gap: float = 0.55,
             # compass, i.e. octave-scale displacement, is charged for.
             excess = max(0.0, abs(p - register_center) - register_freeband)
             v -= register_weight * min(excess, 15)
-            # Floored just above zero: if a passage really was only
-            # detected an octave away, a wrong-octave note still beats a
-            # silent gap - it just loses to any in-register alternative.
-            v = max(v, 0.02)
+            # No floor here. v7.6.5 clamped this to a small positive value,
+            # reasoning that a wrong-octave note still beats a silent gap.
+            # That was wrong, and measurably so: with every candidate worth
+            # at least something, the search had no reason to reject any
+            # non-conflicting note, and the left hand went from 90 notes in
+            # pass 1 to 182 in pass 2 - a pass whose whole purpose is to
+            # refine a line more than doubled it. A note the scoring says
+            # is not worth having should be droppable; a rest is a valid
+            # musical statement and silence is better than filler.
         sal.append(v)
 
     best = list(sal)
@@ -673,14 +695,24 @@ def _reduce_polyphony_to_two_voices(note_events, min_dur_ms: float = 80.0,
     weights = np.array([(e[1] - e[0]) * e[3] for e in events], dtype=float)
     if weights.max() > 0:
         reps = np.clip(np.round(weights / (weights.max() / 6.0)), 1, 6).astype(int)
-        split_midi = _two_means_split_midi(np.repeat(pitches, reps))
+        split_midi, separation = _two_means_split_midi(np.repeat(pitches, reps))
     else:
-        split_midi = _two_means_split_midi(pitches)
+        split_midi, separation = _two_means_split_midi(pitches)
+
+    # Two registers, or one? Melody and accompaniment sit at least an
+    # octave apart; anything closer is one body of material that 2-means
+    # has divided only because it was asked to. Splitting there would tear
+    # a single line in half and hand the lower part to the wrong staff.
+    if separation < 12.0:
+        print(f"[EXTRACT] cluster centres only {separation:.0f} semitones apart - "
+              f"treating this as a single register, no hand split")
+        split_midi = 0
 
     min_dur = min_dur_ms / 1000.0
     upper = [e for e in events if e[2] >= split_midi and (e[1] - e[0]) >= min_dur]
     lower = [e for e in events if e[2] < split_midi and (e[1] - e[0]) >= min_dur]
-    print(f"[EXTRACT] split at MIDI {split_midi}: {len(upper)} upper / {len(lower)} lower candidates")
+    print(f"[EXTRACT] split at MIDI {split_midi} (cluster separation {separation:.0f} st): "
+          f"{len(upper)} upper / {len(lower)} lower candidates")
 
     # Two passes. The first finds a provisional line; its weighted median
     # pitch is the register the line spends most of its length in, which
@@ -704,10 +736,14 @@ def _reduce_polyphony_to_two_voices(note_events, min_dur_ms: float = 80.0,
         return second, center
 
     mel, _mc = two_pass(upper, 0.0, "melody")
-    bass, _bc = two_pass(lower, -0.004, "bass")
-
     rh = [Note(start=s, end=e, pitch_midi=p, hand="RH") for (s, e, p, _a) in mel]
-    lh = [Note(start=s, end=e, pitch_midi=p, hand="LH") for (s, e, p, _a) in bass]
+
+    if MELODY_ONLY:
+        print("[EXTRACT] melody-only mode: bass line not transcribed")
+        lh = []
+    else:
+        bass, _bc = two_pass(lower, -0.004, "bass")
+        lh = [Note(start=s, end=e, pitch_midi=p, hand="LH") for (s, e, p, _a) in bass]
 
     def _spread(v):
         if len(v) < 2:
@@ -867,7 +903,7 @@ def _estimate_hand_split(y: np.ndarray, sr: int, hop_length: int) -> int:
             print(f"[EXTRACT] Split estimation: only {len(hz)} confident frames, falling back to fixed C4 split")
             return fallback_midi
 
-        split_midi = _two_means_split_midi(librosa.hz_to_midi(hz), fallback=fallback_midi)
+        split_midi, _sep = _two_means_split_midi(librosa.hz_to_midi(hz), fallback=fallback_midi)
         print(f"[EXTRACT] Adaptive hand-split at MIDI {split_midi} "
               f"(vs fixed-C4/MIDI60 fallback)")
         return split_midi
@@ -1210,6 +1246,10 @@ def generate_musicxml_v72(result: TranscriptionResult, title: str = "PianoMagic 
     else:
         rh_notes = [n for n in notes_sorted if n.hand == 'RH']
         lh_notes = [n for n in notes_sorted if n.hand != 'RH']
+        # With no bass line there is nothing to put on a second staff, and
+        # an empty stave of whole rests running the length of the piece is
+        # just clutter to read past. One staff, one clef, no <backup>.
+        two_staff = len(lh_notes) > 0
 
         last_end = max(n.end for n in notes_sorted)
         total_measures = min(2000, max(1, int(last_end / measure_duration) + 1))
@@ -1288,15 +1328,16 @@ def generate_musicxml_v72(result: TranscriptionResult, title: str = "PianoMagic 
                 key = SubElement(attr, 'key')
                 SubElement(key, 'fifths').text = '0'
 
-                SubElement(attr, 'staves').text = '2'
+                SubElement(attr, 'staves').text = '2' if two_staff else '1'
 
                 clef1 = SubElement(attr, 'clef', number='1')
                 SubElement(clef1, 'sign').text = 'G'
                 SubElement(clef1, 'line').text = '2'
 
-                clef2 = SubElement(attr, 'clef', number='2')
-                SubElement(clef2, 'sign').text = 'F'
-                SubElement(clef2, 'line').text = '4'
+                if two_staff:
+                    clef2 = SubElement(attr, 'clef', number='2')
+                    SubElement(clef2, 'sign').text = 'F'
+                    SubElement(clef2, 'line').text = '4'
 
                 direction = SubElement(measure, 'direction', placement='above')
                 dt = SubElement(direction, 'direction-type')
@@ -1309,10 +1350,10 @@ def generate_musicxml_v72(result: TranscriptionResult, title: str = "PianoMagic 
 
             emit_voice(measure, rh_in_measure, measure_start, staff_num=1, voice_num=1)
 
-            backup_el = SubElement(measure, 'backup')
-            SubElement(backup_el, 'duration').text = str(divisions_per_measure)
-
-            emit_voice(measure, lh_in_measure, measure_start, staff_num=2, voice_num=2)
+            if two_staff:
+                backup_el = SubElement(measure, 'backup')
+                SubElement(backup_el, 'duration').text = str(divisions_per_measure)
+                emit_voice(measure, lh_in_measure, measure_start, staff_num=2, voice_num=2)
 
         if dropped[0]:
             print(f"[SCORE] WARNING: {dropped[0]} of {len(notes_sorted)} notes did not fit "
