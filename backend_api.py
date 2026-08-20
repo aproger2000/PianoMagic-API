@@ -1,5 +1,5 @@
 """
-PianoMagic Backend API — v7.7.0
+PianoMagic Backend API — v7.7.1
 Audio-to-piano-score transcription
 """
 
@@ -141,7 +141,7 @@ def _get_bp_model():
 # ───────────────────────────────────────────────────────────────
 # Configuration
 # ───────────────────────────────────────────────────────────────
-VERSION = "7.7.0"
+VERSION = "7.7.1"
 
 # v7.7.0: transcribe the melody only, and leave the bass staff out.
 # The accompaniment line was contributing far more noise than music - on
@@ -280,6 +280,12 @@ class TranscriptionResult:
     key: str = "C major"
     duration: float = 0.0
     sr: int = 22050
+    # Where the beat grid actually starts, in seconds. Carried through to
+    # notation because bar lines have to sit on the same grid the notes
+    # were quantised to - with bars pinned to t=0 and the music starting
+    # 76 ms later, every note lands a fraction of a subdivision inside its
+    # measure and comes out notated as 3/32 and 5/32 oddities.
+    grid_phase: float = 0.0
 
 # ───────────────────────────────────────────────────────────────
 # Utility Functions
@@ -530,6 +536,76 @@ def _suppress_harmonic_partials(events, ratio: float = 0.6, factor: float = 0.45
     return out
 
 
+def _quantize_to_beat_grid(notes: List[Note], tempo: float, subdiv: int = 4) -> List[Note]:
+    """
+    Snap notes to a musical grid derived from the tempo.
+
+    v7.7.1. quantize_notes() rounds to a 50 ms wall-clock grid, which at
+    99 BPM is about one twelfth of a beat - fine enough to preserve every
+    detection wobble and far too fine to mean anything musically. Measured
+    on the v7.7.0 score, only 8% of onsets landed on a beat and 22% on an
+    eighth, and durations took 17 distinct values including 3, 5, 7, 11,
+    19, 21 and 27 thirty-seconds. A children's song is mostly eighths and
+    quarters on the beat; notated like that it is unreadable, and played
+    back it does not sound like the tune even when the pitches are right.
+
+    Two things are needed: a grid spacing (from the tempo) and a grid
+    *phase*. The phase matters as much as the spacing - a performance
+    rarely starts exactly at t=0, and a grid offset by half a subdivision
+    misplaces every note in the piece. It is estimated as the circular
+    mean of the onsets modulo one grid step, which is the natural
+    estimator for a quantity that wraps.
+    """
+    if not notes or tempo <= 0:
+        return notes, 0.0
+
+    step = 60.0 / tempo / subdiv
+    onsets = np.array([n.start for n in notes], dtype=float)
+
+    ang = 2.0 * np.pi * (np.mod(onsets, step) / step)
+    phase = (np.arctan2(np.sin(ang).mean(), np.cos(ang).mean()) / (2.0 * np.pi)) * step
+    phase = float(np.mod(phase, step))
+
+    def _dev(times):
+        d = np.mod(times - phase, step)
+        return np.minimum(d, step - d)
+
+    before = float(_dev(onsets).mean() / step)
+
+    snapped = []
+    for n in notes:
+        s = round((n.start - phase) / step) * step + phase
+        e = round((n.end - phase) / step) * step + phase
+        # A note just before the grid's first tick snaps to a negative
+        # time. Clamping that to zero would drop it off the grid - and an
+        # off-grid onset drags the phase estimate on any later pass, so
+        # the whole thing stops being idempotent. Move it up a whole step
+        # instead, which keeps it on the grid where it belongs.
+        while s < 0:
+            s += step
+        if e <= s:
+            e = s + step                       # nothing shorter than one grid unit
+        snapped.append(Note(start=s, end=e,
+                            pitch_midi=n.pitch_midi, velocity=n.velocity, hand=n.hand))
+
+    # Snapping can push a note onto its predecessor; a single voice cannot
+    # hold two notes at once, so give the earlier one the space.
+    snapped.sort(key=lambda n: (n.start, n.pitch_midi))
+    out = []
+    for n in snapped:
+        if out and n.start < out[-1].end - 1e-9:
+            n.start = out[-1].end
+            if n.end <= n.start:
+                n.end = n.start + step
+        out.append(n)
+
+    after = float(_dev(np.array([n.start for n in out])).mean() / step)
+    print(f"[EXTRACT] beat grid: 1/{subdiv} of a quarter at {tempo:.1f} BPM "
+          f"({step*1000:.0f} ms), phase {phase*1000:.0f} ms; "
+          f"mean onset deviation {before:.2f} -> {after:.2f} of a grid step")
+    return out, phase
+
+
 def _weighted_median(values, weights) -> float:
     """Median of `values` weighted by `weights`.
 
@@ -699,11 +775,13 @@ def _reduce_polyphony_to_two_voices(note_events, min_dur_ms: float = 80.0,
     else:
         split_midi, separation = _two_means_split_midi(pitches)
 
-    # Two registers, or one? Melody and accompaniment sit at least an
-    # octave apart; anything closer is one body of material that 2-means
-    # has divided only because it was asked to. Splitting there would tear
-    # a single line in half and hand the lower part to the wrong staff.
-    if separation < 12.0:
+    # Two registers, or one? On real melody-plus-accompaniment material
+    # the two centres come out 21-29 semitones apart. A single melody, on
+    # the other hand, easily spans an octave by itself - so a separation
+    # around 12 is no evidence of two voices at all, and splitting there
+    # tears one line in half and hands the lower part to the wrong staff.
+    # 15 sits clear of both cases.
+    if separation < 15.0:
         print(f"[EXTRACT] cluster centres only {separation:.0f} semitones apart - "
               f"treating this as a single register, no hand split")
         split_midi = 0
@@ -827,9 +905,10 @@ def extract_melody_basic_pitch(file_path, y: np.ndarray, sr: int) -> Transcripti
     # musical repetition, so it still stitches a split detection without
     # ever swallowing a real repeated note.
     notes = merge_close_notes(notes, max_gap_ms=25, max_pitch_diff_st=0.0)
-    notes = quantize_notes(notes)
 
+    # Tempo first: rhythm can only be quantised against a known beat.
     tempo, key = _estimate_tempo_and_key(y, sr)
+    notes, grid_phase = _quantize_to_beat_grid(notes, tempo, subdiv=4)
 
     clean = [n for n in notes
              if n.end > n.start and np.isfinite(n.start) and np.isfinite(n.end)
@@ -837,7 +916,7 @@ def extract_melody_basic_pitch(file_path, y: np.ndarray, sr: int) -> Transcripti
     print(f"[EXTRACT] {len(clean)} clean notes returned (basic-pitch engine)")
 
     return TranscriptionResult(notes=clean, tempo=tempo, key=key,
-                               duration=duration, sr=sr)
+                               duration=duration, sr=sr, grid_phase=grid_phase)
 
 def _estimate_tempo_and_key(y: np.ndarray, sr: int):
     tempo = 120.0
@@ -1251,8 +1330,9 @@ def generate_musicxml_v72(result: TranscriptionResult, title: str = "PianoMagic 
         # just clutter to read past. One staff, one clef, no <backup>.
         two_staff = len(lh_notes) > 0
 
+        grid_phase = float(getattr(result, 'grid_phase', 0.0) or 0.0)
         last_end = max(n.end for n in notes_sorted)
-        total_measures = min(2000, max(1, int(last_end / measure_duration) + 1))
+        total_measures = min(2000, max(1, int((last_end - grid_phase) / measure_duration) + 1))
 
         dropped = [0]
 
@@ -1313,7 +1393,7 @@ def generate_musicxml_v72(result: TranscriptionResult, title: str = "PianoMagic 
                 SubElement(rest_el, 'staff').text = str(staff_num)
 
         for m in range(total_measures):
-            measure_start = m * measure_duration
+            measure_start = grid_phase + m * measure_duration
             measure_end = measure_start + measure_duration
             measure = SubElement(part, 'measure', number=str(m + 1))
 
@@ -1345,8 +1425,11 @@ def generate_musicxml_v72(result: TranscriptionResult, title: str = "PianoMagic 
                 SubElement(metro, 'beat-unit').text = 'quarter'
                 SubElement(metro, 'per-minute').text = str(int(result.tempo))
 
-            rh_in_measure = [n for n in rh_notes if measure_start <= n.start < measure_end]
-            lh_in_measure = [n for n in lh_notes if measure_start <= n.start < measure_end]
+            # The first bar also swallows anything before the grid starts,
+            # so a note a few milliseconds early is not silently orphaned.
+            lo = -1e9 if m == 0 else measure_start
+            rh_in_measure = [n for n in rh_notes if lo <= n.start < measure_end]
+            lh_in_measure = [n for n in lh_notes if lo <= n.start < measure_end]
 
             emit_voice(measure, rh_in_measure, measure_start, staff_num=1, voice_num=1)
 
