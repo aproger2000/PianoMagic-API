@@ -1,5 +1,5 @@
 """
-PianoMagic Backend API — v7.7.1
+PianoMagic Backend API — v7.7.2
 Audio-to-piano-score transcription
 """
 
@@ -141,7 +141,7 @@ def _get_bp_model():
 # ───────────────────────────────────────────────────────────────
 # Configuration
 # ───────────────────────────────────────────────────────────────
-VERSION = "7.7.1"
+VERSION = "7.7.2"
 
 # v7.7.0: transcribe the melody only, and leave the bass staff out.
 # The accompaniment line was contributing far more noise than music - on
@@ -536,6 +536,70 @@ def _suppress_harmonic_partials(events, ratio: float = 0.6, factor: float = 0.45
     return out
 
 
+def _collapse_octave_duplicates(notes: List[Note], center: float,
+                                min_share: float = 0.20) -> List[Note]:
+    """
+    Keep each pitch class in one octave.
+
+    v7.7.2. Measured on the v7.7.1 melody, the two commonest pitches after
+    A#4 were F4 and F5 - the same note an octave apart, 19 and 18
+    occurrences - and F4<->F5 was the single most common large leap in the
+    piece. D#4/D#5 did the same. A tune does not normally sing one note in
+    two octaves; a transcriber does that when it cannot decide which
+    octave a note is in, and the result reads as a melody leaping about
+    even though the pitch classes are right.
+
+    The register anchor cannot catch this: with a home register of 70 and
+    a free band of 7 semitones, both 65 and 77 sit inside the band and
+    cost nothing. So it is resolved here instead, per pitch class, after
+    the line exists.
+
+    Every duplicated pitch class is collapsed, including one where a
+    single stray note sits an octave off. That is deliberate: in an
+    automatic transcription whose known failure mode is octave confusion,
+    a lone octave outlier is far more likely a slip than intent. The cost
+    is real but small - a melody that genuinely leaps an octave once will
+    have that leap flattened.
+
+    Which octave survives depends on the evidence. When one octave holds
+    nearly all the notes, it wins outright. When both carry a real share -
+    F4 and F5 above were 19 and 18 - counting cannot decide, so the one
+    nearer the home register wins.
+    """
+    if not notes:
+        return notes
+
+    from collections import Counter, defaultdict
+    by_class = defaultdict(list)
+    for i, n in enumerate(notes):
+        by_class[n.pitch_midi % 12].append(i)
+
+    moved = 0
+    details = []
+    for pc, idxs in by_class.items():
+        octs = Counter(notes[i].pitch_midi // 12 for i in idxs)
+        if len(octs) < 2:
+            continue
+        (o1, c1), (o2, c2) = octs.most_common(2)
+        if abs(o1 - o2) != 1:
+            continue                       # not an octave apart: leave alone
+        if min(c1, c2) / float(c1 + c2) < min_share:
+            target = o1 if c1 >= c2 else o2          # one is a stray slip
+        else:
+            p1, p2 = o1 * 12 + pc, o2 * 12 + pc
+            target = o1 if abs(p1 - center) <= abs(p2 - center) else o2
+        loser = o2 if target == o1 else o1
+        for i in idxs:
+            if notes[i].pitch_midi // 12 == loser:
+                notes[i].pitch_midi = target * 12 + pc
+                moved += 1
+        details.append(f"{loser*12+pc}->{target*12+pc}")
+
+    if moved:
+        print(f"[EXTRACT] octave consistency: moved {moved} notes ({', '.join(details)})")
+    return notes
+
+
 def _quantize_to_beat_grid(notes: List[Note], tempo: float, subdiv: int = 4) -> List[Note]:
     """
     Snap notes to a musical grid derived from the tempo.
@@ -813,8 +877,10 @@ def _reduce_polyphony_to_two_voices(note_events, min_dur_ms: float = 80.0,
               f"(pass 1: {len(first)} notes -> pass 2: {len(second)} notes)")
         return second, center
 
-    mel, _mc = two_pass(upper, 0.0, "melody")
+    mel, mel_center = two_pass(upper, 0.0, "melody")
     rh = [Note(start=s, end=e, pitch_midi=p, hand="RH") for (s, e, p, _a) in mel]
+    if mel_center is not None:
+        rh = _collapse_octave_duplicates(rh, mel_center)
 
     if MELODY_ONLY:
         print("[EXTRACT] melody-only mode: bass line not transcribed")
