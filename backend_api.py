@@ -1,5 +1,5 @@
 """
-PianoMagic Backend API — v7.6.4
+PianoMagic Backend API — v7.6.5
 Audio-to-piano-score transcription
 """
 
@@ -141,7 +141,7 @@ def _get_bp_model():
 # ───────────────────────────────────────────────────────────────
 # Configuration
 # ───────────────────────────────────────────────────────────────
-VERSION = "7.6.4"
+VERSION = "7.6.5"
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "pianomagic_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 print(f"[INIT] UPLOAD_DIR={UPLOAD_DIR}, exists={UPLOAD_DIR.exists()}")
@@ -462,8 +462,81 @@ def _two_means_split_midi(midi_vals: np.ndarray, fallback: int = 60) -> int:
     lo, hi = sorted([c1, c2])
     return max(48, min(72, int(round((lo + hi) / 2))))
 
+def _suppress_harmonic_partials(events, ratio: float = 0.6, factor: float = 0.45):
+    """
+    Damp candidates that look like an octave/twelfth partial of a lower
+    note sounding at the same time.
+
+    A pitch detector reports a note's overtones as notes in their own
+    right. Those partials are what pull a melody line an octave up: they
+    are concurrent with the real note and just as smooth, so nothing in a
+    salience-plus-continuity cost distinguishes them.
+
+    The physical asymmetry is the useful part - a partial requires its
+    fundamental to be sounding, but not the reverse. So a candidate with
+    a concurrent note 12, 19 or 24 semitones BELOW it, of comparable or
+    greater salience, is treated as probably that note's overtone and
+    loses weight. Nothing is deleted: a partial that is genuinely the
+    only thing there can still be chosen.
+
+    Doing this before estimating the home register matters as much as the
+    damping itself - the register estimate is a median over the selected
+    line, and it can only be trusted if the line it is measuring hasn't
+    already been captured by partials.
+    """
+    if not events:
+        return events
+
+    sal = [(e[1] - e[0]) * e[3] for e in events]
+    order = sorted(range(len(events)), key=lambda i: events[i][0])
+    out = list(events)
+    suppressed = 0
+
+    for idx_pos, i in enumerate(order):
+        si, ei, pi, ai = events[i]
+        best_support = 0.0
+        # Only notes starting before this one can overlap it; walking
+        # backwards while starts are still within reach keeps this linear
+        # in practice rather than quadratic.
+        for j in order[max(0, idx_pos - 250):idx_pos]:
+            sj, ej, pj, _aj = events[j]
+            if ej <= si:
+                continue                      # no overlap in time
+            if pi - pj in (12, 19, 24):
+                best_support = max(best_support, sal[j])
+        if best_support >= ratio * sal[i] and sal[i] > 0:
+            out[i] = (si, ei, pi, ai * factor)
+            suppressed += 1
+
+    print(f"[EXTRACT] harmonic suppression: {suppressed}/{len(events)} candidates "
+          f"look like partials of a concurrent lower note")
+    return out
+
+
+def _weighted_median(values, weights) -> float:
+    """Median of `values` weighted by `weights`.
+
+    Used to find a line's home register. A median rather than a mean
+    because the input is exactly the situation a mean handles badly: a
+    line that spends part of its length an octave away should not drag
+    the estimate half an octave off - it should be outvoted.
+    """
+    pairs = sorted(zip(values, weights))
+    total = sum(w for _v, w in pairs)
+    if total <= 0:
+        return float(np.median(values)) if len(values) else 0.0
+    acc = 0.0
+    for v, w in pairs:
+        acc += w
+        if acc >= total / 2.0:
+            return float(v)
+    return float(pairs[-1][0])
+
+
 def _select_line(cands, jump_weight: float = 0.06, phrase_gap: float = 0.55,
-                 pitch_bias: float = 0.0, dur_cap: float = 1.0):
+                 pitch_bias: float = 0.0, dur_cap: float = 1.0,
+                 register_center=None, register_weight: float = 0.10,
+                 register_freeband: float = 7.0):
     """
     Pick ONE monophonic line out of overlapping note candidates, by
     choosing the non-overlapping chain that maximises
@@ -502,7 +575,29 @@ def _select_line(cands, jump_weight: float = 0.06, phrase_gap: float = 0.55,
     # regardless of how the model scales its amplitudes.
     sal = []
     for (s, e, p, a) in cands:
-        sal.append((a / amax) * min(e - s, dur_cap) / dur_cap + pitch_bias * p)
+        v = (a / amax) * min(e - s, dur_cap) / dur_cap + pitch_bias * p
+        if register_center is not None:
+            # Global anchor to the line's home register. The jump penalty
+            # alone is purely local, so shifting an octave once at a phrase
+            # boundary is cheap - and once there, the wrong octave is
+            # exactly as smooth as the right one, so nothing pulls the line
+            # back. Measured on the v7.6.4 output, whole sections sat at
+            # MIDI 81-82 or 60-61 against a true melody register of 69-72:
+            # displaced by almost precisely +/-12. Charging for distance
+            # from the home register makes a sustained octave excursion
+            # cost as much as it musically should.
+            # Deadband first: a real melody ranges freely over an octave or
+            # so, and charging per semitone from the very first one erodes
+            # its extremes - a test melody spanning 67-77 lost its lowest
+            # note that way. Only deviation beyond a normal melodic
+            # compass, i.e. octave-scale displacement, is charged for.
+            excess = max(0.0, abs(p - register_center) - register_freeband)
+            v -= register_weight * min(excess, 15)
+            # Floored just above zero: if a passage really was only
+            # detected an octave away, a wrong-octave note still beats a
+            # silent gap - it just loses to any in-register alternative.
+            v = max(v, 0.02)
+        sal.append(v)
 
     best = list(sal)
     prev = [-1] * n
@@ -571,6 +666,9 @@ def _reduce_polyphony_to_two_voices(note_events, min_dur_ms: float = 80.0,
     # the boundary up into the middle of the melody - which then splits
     # the tune across both staves. Loudness x duration makes the notes a
     # listener would call "the music" decide where the hands divide.
+    # Damp probable overtones before anything measures this candidate set.
+    events = _suppress_harmonic_partials(events)
+
     pitches = np.array([e[2] for e in events], dtype=float)
     weights = np.array([(e[1] - e[0]) * e[3] for e in events], dtype=float)
     if weights.max() > 0:
@@ -584,12 +682,29 @@ def _reduce_polyphony_to_two_voices(note_events, min_dur_ms: float = 80.0,
     lower = [e for e in events if e[2] < split_midi and (e[1] - e[0]) >= min_dur]
     print(f"[EXTRACT] split at MIDI {split_midi}: {len(upper)} upper / {len(lower)} lower candidates")
 
+    # Two passes. The first finds a provisional line; its weighted median
+    # pitch is the register the line spends most of its length in, which
+    # is a far better estimate of "where this tune lives" than anything
+    # available before selection. The second pass re-runs anchored to that
+    # register, which is what pulls octave-displaced sections home.
+    #
     # Melody: no pitch bias - loudness and smoothness decide, so the line
     # follows what is actually played rather than whatever sits highest.
     # Bass: a small downward bias, because the bass line genuinely is the
     # bottom of the texture even when an inner voice is louder.
-    mel = _select_line(upper, pitch_bias=0.0)
-    bass = _select_line(lower, pitch_bias=-0.004)
+    def two_pass(cands, pitch_bias, label):
+        first = _select_line(cands, pitch_bias=pitch_bias)
+        if len(first) < 8:
+            return first, None
+        center = _weighted_median([p for (_s, _e, p, _a) in first],
+                                  [(e - s) * a for (s, e, _p, a) in first])
+        second = _select_line(cands, pitch_bias=pitch_bias, register_center=center)
+        print(f"[EXTRACT] {label}: home register MIDI {center:.0f} "
+              f"(pass 1: {len(first)} notes -> pass 2: {len(second)} notes)")
+        return second, center
+
+    mel, _mc = two_pass(upper, 0.0, "melody")
+    bass, _bc = two_pass(lower, -0.004, "bass")
 
     rh = [Note(start=s, end=e, pitch_midi=p, hand="RH") for (s, e, p, _a) in mel]
     lh = [Note(start=s, end=e, pitch_midi=p, hand="LH") for (s, e, p, _a) in bass]
