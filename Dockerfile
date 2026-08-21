@@ -23,7 +23,11 @@ RUN pip install --no-cache-dir -r requirements.txt
 # two can't disagree. Guarded so the build still succeeds if it is absent.
 RUN pip uninstall -y tflite-runtime || true
 
-COPY backend_api.py .
+# voices.py is imported by backend_api.py. It has to be copied
+# explicitly: this image copies named files, not the directory, so a new
+# module that is not listed here simply is not in the container and the
+# service dies on import at startup.
+COPY backend_api.py voices.py .
 
 ENV QT_QPA_PLATFORM=offscreen
 

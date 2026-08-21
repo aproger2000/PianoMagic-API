@@ -1,5 +1,5 @@
 """
-PianoMagic Backend API — v7.9.0
+PianoMagic Backend API — v7.10.0
 Audio-to-piano-score transcription
 """
 
@@ -22,6 +22,7 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from xml.etree.ElementTree import Element, SubElement, tostring
+import voices as _voices
 from xml.dom import minidom
 
 import soundfile as sf
@@ -143,7 +144,8 @@ def _get_bp_model():
 # ───────────────────────────────────────────────────────────────
 # Configuration
 # ───────────────────────────────────────────────────────────────
-VERSION = "7.9.0"
+VERSION = "7.10.0"
+_LAST_RAW_EVENTS = None
 
 # How far below the RH/LH cluster boundary the melody selector is still
 # allowed to look. A melodic line does not stop at the boundary a
@@ -1158,6 +1160,42 @@ def _reduce_polyphony_to_two_voices(note_events, min_dur_ms: float = 45.0,
         return line, center
 
     mel, mel_center = pick_melody(upper)
+
+    # Second opinion, from a different formulation of the problem.
+    #
+    # pick_melody asks "which single chain of notes scores best" - it
+    # picks a path. voices.top_voice asks "how do these notes divide into
+    # simultaneous parts", and then takes the top part. The second is the
+    # question a listener answers, and on a clean three-part test it
+    # recovers the tune exactly where path-picking recovers half of it.
+    # On notes polluted with partials it degrades, which is why neither
+    # is trusted outright: both are scored and the better line wins, the
+    # same way the pitch_bias sweep is decided.
+    try:
+        idx = _voices.top_voice([(s_, e_, p_, a_) for (s_, e_, p_, a_) in upper])
+        cand = [upper[i] for i in sorted(idx, key=lambda i: upper[i][0])]
+        trimmed = []
+        for k, (s_, e_, p_, a_) in enumerate(cand):
+            if k + 1 < len(cand):
+                e_ = min(e_, cand[k + 1][0])
+            if e_ > s_:
+                trimmed.append((s_, e_, p_, a_))
+        sc_v, st_v = _melodicity(trimmed)
+        sc_p, _st_p = _melodicity(mel)
+        print(f"[EXTRACT]   voice separation: {st_v}")
+        if sc_v > sc_p + 0.02:
+            print(f"[EXTRACT] melody: voice separation wins "
+                  f"({sc_v:+.3f} vs {sc_p:+.3f}) - using the top voice")
+            mel = trimmed
+            if len(mel) >= 8:
+                mel_center = _weighted_median(
+                    [p for (_s, _e, p, _a) in mel],
+                    [(e - s) * a for (s, e, _p, a) in mel])
+        else:
+            print(f"[EXTRACT] melody: path selection kept "
+                  f"({sc_p:+.3f} vs {sc_v:+.3f})")
+    except Exception as exc:                        # noqa: BLE001
+        print(f"[EXTRACT] voice separation unavailable: {exc}")
     rh = [Note(start=s, end=e, pitch_midi=p, hand="RH") for (s, e, p, _a) in mel]
     if mel_center is not None:
         rh = _collapse_octave_duplicates(rh, mel_center)
@@ -1273,6 +1311,8 @@ def extract_melody_basic_pitch(file_path, y: np.ndarray, sr: int) -> Transcripti
             pass
     print(f"[EXTRACT] Basic Pitch returned {len(note_events)} note events")
 
+    global _LAST_RAW_EVENTS
+    _LAST_RAW_EVENTS = list(note_events)
     notes = _reduce_polyphony_to_two_voices(note_events)
     # v7.6.4: 25 ms, not 90 ms. merge_close_notes exists for the PYIN path,
     # where a continuous pitch contour gets chopped into many same-pitch
@@ -1996,6 +2036,26 @@ async def _process_audio_inner(task_id: str, file_path: Path):
         # Engrave. MusicXML is what another program reads; a PDF is what a
         # person reads. Failure is not fatal - the score still exists as
         # MusicXML and the run keeps its result.
+        # The raw detector output, before any of our reduction. Every
+        # melody experiment so far has cost a deploy because this was
+        # thrown away; with it on disk the same ideas can be tried and
+        # measured locally against a real run.
+        try:
+            import json as _json
+            raw_path = UPLOAD_DIR / f"PianoMagic_{file_id}.json"
+            raw_path.write_text(_json.dumps({
+                'version': VERSION,
+                'tempo': result.tempo,
+                'key': result.key,
+                'events': [[round(float(ev[0]), 4), round(float(ev[1]), 4),
+                            int(ev[2]), round(float(ev[3]), 4)]
+                           for ev in (_LAST_RAW_EVENTS or [])],
+            }))
+            print(f"[TASK {task_id}] raw events saved: "
+                  f"{len(_LAST_RAW_EVENTS or [])} -> {raw_path.name}")
+        except Exception as exc:                    # noqa: BLE001
+            print(f"[TASK {task_id}] raw events not saved: {exc}")
+
         pdf_path = UPLOAD_DIR / f"PianoMagic_{file_id}.pdf"
         pdf_ok, pdf_msg = musicxml_to_pdf(xml_path, pdf_path)
         print(f"[TASK {task_id}] PDF {'saved' if pdf_ok else 'NOT produced'}: {pdf_msg}")
@@ -2033,6 +2093,7 @@ async def _process_audio_inner(task_id: str, file_path: Path):
             'wav_url': f'/download/{file_id}.wav',
             'xml_url': f'/download/{file_id}.xml',
             'pdf_url': f'/download/{file_id}.pdf' if pdf_ok else None,
+            'raw_url': f'/download/{file_id}.json',
             'pdf_error': None if pdf_ok else pdf_msg,
             # Which engine actually produced these notes. Reported per
             # result, not just per process, because the neural engine can
@@ -2133,14 +2194,15 @@ async def download_file(file_id: str):
     # first and look up the exact file that was actually written.
     stem = Path(file_id).stem
     requested_ext = Path(file_id).suffix.lower()
-    candidates = ([requested_ext] if requested_ext in ('.wav', '.xml', '.pdf')
-                  else ['.wav', '.xml', '.pdf'])
+    candidates = ([requested_ext] if requested_ext in ('.wav', '.xml', '.pdf', '.json')
+                  else ['.wav', '.xml', '.pdf', '.json'])
 
     for ext in candidates:
         file_path = UPLOAD_DIR / f"PianoMagic_{stem}{ext}"
         if file_path.exists():
             media_type = {'.wav': 'audio/wav',
                           '.pdf': 'application/pdf',
+                          '.json': 'application/json',
                           '.xml': 'application/vnd.recordare.musicxml+xml'}[ext]
             return FileResponse(str(file_path), media_type=media_type,
                               filename=f"PianoMagic_{stem}{ext}")
