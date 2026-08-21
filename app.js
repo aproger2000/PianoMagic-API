@@ -1,6 +1,6 @@
-/* PianoMagic Frontend — v7.8.1 */
+/* PianoMagic Frontend — v7.8.2 */
 
-const FE_VERSION = '7.8.1';
+const FE_VERSION = '7.8.2';
 const API_BASE = 'https://pianomagic-api.onrender.com';
 
 // State

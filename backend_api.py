@@ -1,5 +1,5 @@
 """
-PianoMagic Backend API — v7.8.1
+PianoMagic Backend API — v7.8.2
 Audio-to-piano-score transcription
 """
 
@@ -141,7 +141,7 @@ def _get_bp_model():
 # ───────────────────────────────────────────────────────────────
 # Configuration
 # ───────────────────────────────────────────────────────────────
-VERSION = "7.8.1"
+VERSION = "7.8.2"
 
 # How far below the RH/LH cluster boundary the melody selector is still
 # allowed to look. A melodic line does not stop at the boundary a
@@ -295,9 +295,54 @@ class TranscriptionResult:
 # ───────────────────────────────────────────────────────────────
 # Utility Functions
 # ───────────────────────────────────────────────────────────────
-def midi_to_ly_step(midi: int) -> tuple:
-    names = ['C', 'C', 'D', 'D', 'E', 'F', 'F', 'G', 'G', 'A', 'A', 'B']
-    alters = [0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0]
+# Circle-of-fifths signature for every tonic, indexed by pitch class.
+# These pick the signature a musician would actually write: Db major
+# rather than C# major (5 flats, not 7 sharps), Eb minor rather than
+# D# minor (6 flats, not 6 sharps).
+_MAJOR_FIFTHS = {0: 0, 1: -5, 2: 2, 3: -3, 4: 4, 5: -1,
+                 6: 6, 7: 1, 8: -4, 9: 3, 10: -2, 11: 5}
+_MINOR_FIFTHS = {9: 0, 10: -5, 11: 2, 0: -3, 1: 4, 2: -1,
+                 3: -6, 4: 1, 5: -4, 6: 3, 7: -2, 8: 5}
+_PC_OF_NAME = {'C': 0, 'D': 2, 'E': 4, 'F': 5, 'G': 7, 'A': 9, 'B': 11}
+
+
+def key_signature_fifths(key_name: str) -> int:
+    """
+    Number of sharps (positive) or flats (negative) for a detected key.
+
+    v7.8.2. generate_musicxml_v72 hardcoded <fifths>0</fifths>, so every
+    score came out in C major no matter what the analysis had found, and
+    every accidental was then spelled as a sharp. On the test file, which
+    reads as F minor, that produced C#/D#/G#/A# throughout where the music
+    wants Db/Eb/Ab/Bb - the right notes, written so they are painful to
+    read against a reference edition in flats.
+    """
+    if not key_name:
+        return 0
+    parts = key_name.split()
+    tonic, mode = parts[0], (parts[1].lower() if len(parts) > 1 else 'major')
+    pc = _PC_OF_NAME.get(tonic[:1].upper())
+    if pc is None:
+        return 0
+    for ch in tonic[1:]:
+        if ch in ('#', '\u266f'):
+            pc += 1
+        elif ch in ('b', '\u266d'):
+            pc -= 1
+    pc %= 12
+    table = _MINOR_FIFTHS if mode.startswith('min') else _MAJOR_FIFTHS
+    return table.get(pc, 0)
+
+
+def midi_to_ly_step(midi: int, fifths: int = 0) -> tuple:
+    """Spell a MIDI note. A key with flats in its signature spells its
+    black notes as flats; anything else uses sharps."""
+    if fifths < 0:
+        names = ['C', 'D', 'D', 'E', 'E', 'F', 'G', 'G', 'A', 'A', 'B', 'B']
+        alters = [0, -1, 0, -1, 0, 0, -1, 0, -1, 0, -1, 0]
+    else:
+        names = ['C', 'C', 'D', 'D', 'E', 'F', 'F', 'G', 'G', 'A', 'A', 'B']
+        alters = [0, 1, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0]
     octave = (midi // 12) - 1
     idx = midi % 12
     return names[idx], alters[idx], octave
@@ -490,7 +535,7 @@ def _two_means_split_midi(midi_vals: np.ndarray, fallback: int = 60):
     lo, hi = sorted([c1, c2])
     return max(48, min(72, int(round((lo + hi) / 2)))), float(hi - lo)
 
-def _suppress_harmonic_partials(events, ratio: float = 0.6, factor: float = 0.25,
+def _suppress_harmonic_partials(events, ratio: float = 0.35, factor: float = 0.25,
                                 offsets=(12, 19, 24, 28, 31)):
     """
     Damp candidates that look like an overtone of a lower note sounding
@@ -517,6 +562,14 @@ def _suppress_harmonic_partials(events, ratio: float = 0.6, factor: float = 0.25
     transcription kept choosing were precisely those reinforced from
     below (MIDI 70 over a 46/58 bass, 72 over 48/60, 73 over 49/61), so
     the 5th and 6th are worth charging for too.
+
+    v7.8.2 lowers the support ratio from 0.6 to 0.35. At 0.6 a partial
+    only lost weight when its fundamental was nearly as salient as it -
+    but a bright overtone routinely outweighs the note producing it. A
+    measured case with a fundamental at 0.35 and its octave at 0.85 was
+    not damped at all, and the line followed the overtone for all 16
+    notes. At 0.35 it recovers every one, and a control where the melody
+    genuinely sits an octave above a loud bass note is untouched.
 
     Doing this before estimating the home register matters as much as the
     damping itself - the register estimate is a median over the selected
@@ -988,7 +1041,64 @@ def _reduce_polyphony_to_two_voices(note_events, min_dur_ms: float = 45.0,
               f"(pass 1: {len(first)} notes -> pass 2: {len(second)} notes)")
         return second, center
 
-    mel, mel_center = two_pass(upper, 0.0, "melody")
+    def _melodicity(line):
+        """How much the selected line behaves like a tune rather than an
+        accompaniment part. A melody moves, mostly by step; a chordal
+        inner voice sits on one pitch and an overtone trail leaps by
+        octaves. Returns (score, stats-string)."""
+        if len(line) < 8:
+            return -1e9, "too short"
+        ps = [p for (_s, _e, p, _a) in line]
+        jumps = [abs(b - a) for a, b in zip(ps, ps[1:])]
+        n = float(len(jumps))
+        rep = sum(1 for j in jumps if j == 0) / n
+        step = sum(1 for j in jumps if 1 <= j <= 2) / n
+        oct_ = sum(1 for j in jumps if j >= 12) / n
+        score = step - 0.5 * rep - 1.0 * oct_
+        return score, (f"{len(line)} notes, MIDI {min(ps)}-{max(ps)}, "
+                       f"{100*rep:.0f}% repeat / {100*step:.0f}% stepwise / "
+                       f"{100*oct_:.0f}% octave+, melodicity {score:+.3f}")
+
+    def pick_melody(cands):
+        """
+        v7.8.2. The melody pass used to run at a fixed pitch_bias of 0,
+        so the line settled wherever the salience mass was - and in a
+        piano arrangement that mass is the accompaniment, which plays on
+        every eighth while the tune plays on some of them. The v7.8.1 run
+        bore this out: with the hands split at MIDI 59 the melody line
+        came home to MIDI 61, the very bottom of the upper cluster, and
+        repeated a pitch on 51% of its steps.
+
+        Rather than guess a constant, run the selection at a few upward
+        biases and keep the line that most behaves like a tune - moving,
+        mostly by step, without octave leaps. The reference edition for
+        the test file is a piano arrangement whose melody is the top
+        voice, which is what an upward bias expresses; measuring the
+        result means the bias only wins where it actually helps.
+        """
+        tried = []
+        for bias in (0.0, 0.015, 0.030):
+            line, center = two_pass(cands, bias, f"melody @bias {bias:.3f}")
+            score, stats = _melodicity(line)
+            print(f"[EXTRACT]   bias {bias:.3f}: {stats}")
+            tried.append((score, bias, line, center))
+
+        # Melodicity alone cannot separate the tune from an inner voice
+        # moving in parallel with it - both move by step, so both score
+        # the same. A measured test of exactly that case tied at 0.000
+        # and 0.030 while the higher bias recovered 13 of 24 melody notes
+        # against 2. So ties are broken upward: in a piano arrangement the
+        # tune is the top voice, and that is the assumption to fall back
+        # on when the evidence is indifferent. A bias only loses here by
+        # producing a measurably less melodic line.
+        top = max(sc for sc, _b, _l, _c in tried)
+        score, bias, line, center = max(
+            (t for t in tried if t[0] >= top - 0.02), key=lambda t: t[1])
+        print(f"[EXTRACT] melody: chose pitch_bias {bias:.3f} "
+              f"(melodicity {score:+.3f}, best {top:+.3f})")
+        return line, center
+
+    mel, mel_center = pick_melody(upper)
     rh = [Note(start=s, end=e, pitch_midi=p, hand="RH") for (s, e, p, _a) in mel]
     if mel_center is not None:
         rh = _collapse_octave_duplicates(rh, mel_center)
@@ -1529,6 +1639,11 @@ def generate_musicxml_v72(result: TranscriptionResult, title: str = "PianoMagic 
     seconds_per_beat = 60.0 / result.tempo
     measure_duration = beats_per_measure * seconds_per_beat
 
+    fifths = key_signature_fifths(getattr(result, 'key', '') or '')
+    mode = 'minor' if 'minor' in (getattr(result, 'key', '') or '').lower() else 'major'
+    print(f"[SCORE] key {result.key!r} -> signature {fifths:+d} "
+          f"({'flats' if fifths < 0 else 'sharps' if fifths else 'none'})")
+
     notes_sorted = sorted(result.notes, key=lambda n: n.start)
 
     if not notes_sorted:
@@ -1539,7 +1654,8 @@ def generate_musicxml_v72(result: TranscriptionResult, title: str = "PianoMagic 
         SubElement(time, 'beats').text = '4'
         SubElement(time, 'beat-type').text = '4'
         key_el = SubElement(attr, 'key')
-        SubElement(key_el, 'fifths').text = '0'
+        SubElement(key_el, 'fifths').text = str(fifths)
+        SubElement(key_el, 'mode').text = mode
         SubElement(attr, 'staves').text = '2'
         clef1 = SubElement(attr, 'clef', number='1')
         SubElement(clef1, 'sign').text = 'G'
@@ -1604,7 +1720,7 @@ def generate_musicxml_v72(result: TranscriptionResult, title: str = "PianoMagic 
                     continue
 
                 note_el = SubElement(measure_el, 'note')
-                step, alter, octave = midi_to_ly_step(note.pitch_midi)
+                step, alter, octave = midi_to_ly_step(note.pitch_midi, fifths)
                 pitch_el = SubElement(note_el, 'pitch')
                 SubElement(pitch_el, 'step').text = step
                 if alter != 0:
@@ -1637,7 +1753,8 @@ def generate_musicxml_v72(result: TranscriptionResult, title: str = "PianoMagic 
                 SubElement(time, 'beat-type').text = '4'
 
                 key = SubElement(attr, 'key')
-                SubElement(key, 'fifths').text = '0'
+                SubElement(key, 'fifths').text = str(fifths)
+                SubElement(key, 'mode').text = mode
 
                 SubElement(attr, 'staves').text = '2' if two_staff else '1'
 

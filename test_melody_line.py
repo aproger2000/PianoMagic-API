@@ -11,7 +11,9 @@ class Note:
     hand: str = "RH"
     velocity: int = 80
 ns={'np':np,'Note':Note,'List':list}
-for f in ['_suppress_harmonic_partials','_select_line','_weighted_median','_collapse_octave_duplicates','_quantize_to_beat_grid','_two_means_split_midi']:
+# module-level tables the key helpers close over
+exec(src[src.index('_MAJOR_FIFTHS = {'):src.index('def key_signature_fifths')], ns)
+for f in ['_suppress_harmonic_partials','_select_line','_weighted_median','_collapse_octave_duplicates','_quantize_to_beat_grid','_two_means_split_midi','key_signature_fifths','midi_to_ly_step']:
     exec(grab(f),ns)
 SUP,SEL,COL,QNT=ns['_suppress_harmonic_partials'],ns['_select_line'],ns['_collapse_octave_duplicates'],ns['_quantize_to_beat_grid']
 def quiet(f,*a,**k):
@@ -78,5 +80,38 @@ check("overlapping notes do not push the rhythm later",
 low=[(i*beat,i*beat+0.28,p,0.7) for i,p in enumerate([70,68,66,64,62,60,62,64,66,68,70,72])]
 got=[p for _s,_e,p,_a in SEL(low)]
 check("a melody that dips low is not cut off", min(got)<=60, f"lowest kept {min(got)}")
+
+
+# 9. a loud overtone over a quiet fundamental must not capture the line
+beat=0.303
+mel3=[60,62,63,65,63,62,60,58,60,62,63,62,60,58,57,58]
+c3=[];t3=set()
+for i,p in enumerate(mel3):
+    st_=i*beat; c3.append((st_,st_+0.28,p,0.35)); t3.add((round(st_,3),p))
+    c3.append((st_,st_+0.28,p+12,0.85))
+L=SEL(quiet(SUP,c3))
+check("quiet fundamental beats its own loud overtone",
+      sum(1 for s,e,p,a in L if (round(s,3),p) in t3) >= 14,
+      f"{sum(1 for s,e,p,a in L if (round(s,3),p) in t3)}/{len(mel3)} recovered")
+
+# 10. control: a melody genuinely an octave above a loud bass survives
+mel4=[72,74,76,77,76,74,72,71,72,74,76,74,72,71,69,71]
+c4=[];t4=set()
+for i,p in enumerate(mel4):
+    st_=i*beat; c4.append((st_,st_+0.28,p,0.7)); t4.add((round(st_,3),p))
+for i in range(0,len(mel4),4):
+    st_=i*beat; c4.append((st_,st_+4*beat,60,0.9))
+L=SEL(quiet(SUP,c4))
+check("a melody an octave above a loud bass is not damped away",
+      sum(1 for s,e,p,a in L if (round(s,3),p) in t4) >= 15,
+      f"{sum(1 for s,e,p,a in L if (round(s,3),p) in t4)}/{len(mel4)} kept")
+
+# 11. key signature and spelling
+KS=ns['key_signature_fifths']; SPELL=ns['midi_to_ly_step']
+check("F minor gets four flats", KS('F minor')==-4, f"{KS('F minor')}")
+check("black notes spelled as flats in a flat key",
+      SPELL(61,-4)==('D',-1,4) and SPELL(58,-4)==('B',-1,3),
+      f"{SPELL(61,-4)} {SPELL(58,-4)}")
+check("sharps kept in a sharp key", SPELL(61,3)==('C',1,4))
 
 print("\nALL GOOD" if ok else "\nSOMETHING FAILED")
