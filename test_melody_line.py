@@ -56,4 +56,27 @@ check("quantiser is idempotent",[ (round(n.start,6),n.pitch_midi) for n in q1]==
 # 5. octave collapse leaves a single-octave melody untouched
 mn=[Note(i*0.3,i*0.3+0.25,p) for i,p in enumerate([65,68,70,72,73,72,70,68])]
 check("octave collapse is a no-op on one octave",[n.pitch_midi for n in quiet(COL,mn,70.0)]==[n.pitch_midi for n in mn])
+
+# 6. legato: overlapping detections must not cost every other note
+beat=0.303
+mel=[70,72,73,75,73,72,70,68,70,72,73,72,70,68,66,68]
+worst=16
+for ov in (0.0,0.03,0.06,0.12):
+    c=[(k*beat,k*beat+beat+ov,p,0.6) for k,p in enumerate(mel)]
+    worst=min(worst,len(SEL(c)))
+check("legato overlap does not halve the melody", worst>=len(mel),
+      f"worst case {worst}/{len(mel)} notes kept")
+
+# 7. a note must keep the grid slot it was played on, even when notes overlap
+step=60.0/99/4
+ns_=[Note(i*step*2, i*step*2+step*5, 60+i%4) for i in range(8)]
+q,_=quiet(QNT,ns_,99.0,4)
+check("overlapping notes do not push the rhythm later",
+      [round(n.start/step) for n in q]==[0,2,4,6,8,10,12,14])
+
+# 8. the melody may reach below the hand-split boundary
+low=[(i*beat,i*beat+0.28,p,0.7) for i,p in enumerate([70,68,66,64,62,60,62,64,66,68,70,72])]
+got=[p for _s,_e,p,_a in SEL(low)]
+check("a melody that dips low is not cut off", min(got)<=60, f"lowest kept {min(got)}")
+
 print("\nALL GOOD" if ok else "\nSOMETHING FAILED")

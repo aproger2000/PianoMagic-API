@@ -1,5 +1,5 @@
 """
-PianoMagic Backend API — v7.8.0
+PianoMagic Backend API — v7.8.1
 Audio-to-piano-score transcription
 """
 
@@ -141,7 +141,12 @@ def _get_bp_model():
 # ───────────────────────────────────────────────────────────────
 # Configuration
 # ───────────────────────────────────────────────────────────────
-VERSION = "7.8.0"
+VERSION = "7.8.1"
+
+# How far below the RH/LH cluster boundary the melody selector is still
+# allowed to look. A melodic line does not stop at the boundary a
+# clustering algorithm drew through the middle of the texture.
+MELODY_SPLIT_MARGIN = 7
 
 # v7.7.0: transcribe the melody only, and leave the bass staff out.
 # The accompaniment line was contributing far more noise than music - on
@@ -582,9 +587,16 @@ def _collapse_octave_duplicates(notes: List[Note], center: float,
     have that leap flattened.
 
     Which octave survives depends on the evidence. When one octave holds
-    nearly all the notes, it wins outright. When both carry a real share -
-    F4 and F5 above were 19 and 18 - counting cannot decide, so the one
-    nearer the home register wins.
+    nearly all the notes, it wins outright.
+
+    v7.8.1 changes what happens when both carry a real share. It used to
+    force those to the octave nearer the home register, which on the
+    v7.7.3 run moved 36 of 216 notes - one note in six, rewritten on a
+    tie-break rather than on evidence. An even split is precisely the case
+    where the counting says nothing, and a tune that genuinely uses a note
+    in two octaves looks exactly like this. Since v7.8.0 damps octave
+    partials at the source, where this actually belongs, an even split is
+    now left alone and reported instead of being flattened.
     """
     if not notes:
         return notes
@@ -596,6 +608,7 @@ def _collapse_octave_duplicates(notes: List[Note], center: float,
 
     moved = 0
     details = []
+    kept = []
     for pc, idxs in by_class.items():
         octs = Counter(notes[i].pitch_midi // 12 for i in idxs)
         if len(octs) < 2:
@@ -603,11 +616,10 @@ def _collapse_octave_duplicates(notes: List[Note], center: float,
         (o1, c1), (o2, c2) = octs.most_common(2)
         if abs(o1 - o2) != 1:
             continue                       # not an octave apart: leave alone
-        if min(c1, c2) / float(c1 + c2) < min_share:
-            target = o1 if c1 >= c2 else o2          # one is a stray slip
-        else:
-            p1, p2 = o1 * 12 + pc, o2 * 12 + pc
-            target = o1 if abs(p1 - center) <= abs(p2 - center) else o2
+        if min(c1, c2) / float(c1 + c2) >= min_share:
+            kept.append(f"{min(o1,o2)*12+pc}/{max(o1,o2)*12+pc} ({c1}+{c2})")
+            continue                       # both octaves are really used
+        target = o1 if c1 >= c2 else o2              # one is a stray slip
         loser = o2 if target == o1 else o1
         for i in idxs:
             if notes[i].pitch_midi // 12 == loser:
@@ -617,6 +629,9 @@ def _collapse_octave_duplicates(notes: List[Note], center: float,
 
     if moved:
         print(f"[EXTRACT] octave consistency: moved {moved} notes ({', '.join(details)})")
+    if kept:
+        print(f"[EXTRACT] octave consistency: left {len(kept)} pitch class(es) "
+              f"in two octaves, both genuinely used ({', '.join(kept)})")
     return notes
 
 
@@ -685,14 +700,18 @@ def _quantize_to_beat_grid(notes: List[Note], tempo: float, subdiv: int = 4) -> 
         deduped.append(n)
     n_dup = len(snapped) - len(deduped)
 
-    # Snapping can push a note onto its predecessor; a single voice cannot
-    # hold two notes at once, so give the earlier one the space.
+    # Snapping can push a note onto its predecessor. v7.8.1 shortens the
+    # earlier note instead of delaying the later one. A note's onset is
+    # where its rhythm lives; its release is not. Pushing the later note
+    # forward moved it off the beat it was actually played on, and because
+    # each shove cascaded into the next note, a run of close notes drifted
+    # steadily later until it overflowed the bar and was dropped by the
+    # score writer - which is what the "N notes did not fit their measure"
+    # warning was counting.
     out = []
     for n in deduped:
         if out and n.start < out[-1].end - 1e-9:
-            n.start = out[-1].end
-            if n.end <= n.start:
-                n.end = n.start + step
+            out[-1].end = max(out[-1].start + step, n.start)
         out.append(n)
     if n_dup:
         print(f"[EXTRACT] removed {n_dup} duplicate notes (same pitch, same grid slot)")
@@ -727,8 +746,9 @@ def _weighted_median(values, weights) -> float:
 def _select_line(cands, jump_weight: float = 0.06, phrase_gap: float = 0.55,
                  pitch_bias: float = 0.0, dur_cap: float = 0.30,
                  step_free: float = 2.0, repeat_weight: float = 0.05,
+                 min_onset_gap: float = 0.07,
                  register_center=None, register_weight: float = 0.10,
-                 register_freeband: float = 7.0):
+                 register_freeband: float = 9.0):
     """
     Pick ONE monophonic line out of overlapping note candidates, by
     choosing the non-overlapping chain that maximises
@@ -790,6 +810,11 @@ def _select_line(cands, jump_weight: float = 0.06, phrase_gap: float = 0.55,
             # its extremes - a test melody spanning 67-77 lost its lowest
             # note that way. Only deviation beyond a normal melodic
             # compass, i.e. octave-scale displacement, is charged for.
+            # v7.8.1 widens the free compass from 7 to 9 semitones. A tune
+            # that runs from the tonic up to the sixth above spans 9, and
+            # at 7 the anchor was quietly shaving off its own top and
+            # bottom - notes that are in the melody and were not coming
+            # through.
             excess = max(0.0, abs(p - register_center) - register_freeband)
             v -= register_weight * min(excess, 15)
             # No floor here. v7.6.5 clamped this to a small positive value,
@@ -809,9 +834,20 @@ def _select_line(cands, jump_weight: float = 0.06, phrase_gap: float = 0.55,
         si, _ei, pi, _ai = cands[i]
         bi, pv = best[i], -1
         for j in range(i):
-            _sj, ej, pj, _aj = cands[j]
-            if ej > si + 1e-9:
-                continue  # overlaps: a single voice can't hold both
+            sj, ej, pj, _aj = cands[j]
+            # v7.8.1. This used to demand that j had already *finished*
+            # before i could follow it, which is the wrong model of a
+            # monophonic line. A melody is a sequence of onsets; each note
+            # simply rings until the next one starts. Under the old rule a
+            # single sustained detection - a held chord tone, a pad, a
+            # vowel the model rendered as one long event - vetoed every
+            # melody note underneath it, so those notes were audible in the
+            # source and absent from the score. What a single voice really
+            # cannot do is sound two notes at the same instant, so the
+            # constraint is a minimum spacing between onsets instead; the
+            # selected notes are trimmed to each other afterwards.
+            if si - sj < min_onset_gap:
+                continue
             if (si - ej) > phrase_gap:
                 pen = 0.0
             else:
@@ -837,7 +873,16 @@ def _select_line(cands, jump_weight: float = 0.06, phrase_gap: float = 0.55,
     while k != -1:
         out.append(cands[k])
         k = prev[k]
-    return list(reversed(out))
+    out.reverse()
+
+    # Each note rings until the next one begins - never past it.
+    trimmed = []
+    for idx, (s_, e_, p_, a_) in enumerate(out):
+        if idx + 1 < len(out):
+            e_ = min(e_, out[idx + 1][0])
+        if e_ > s_:
+            trimmed.append((s_, e_, p_, a_))
+    return trimmed
 
 
 def _reduce_polyphony_to_two_voices(note_events, min_dur_ms: float = 45.0,
@@ -907,10 +952,20 @@ def _reduce_polyphony_to_two_voices(note_events, min_dur_ms: float = 45.0,
         split_midi = 0
 
     min_dur = min_dur_ms / 1000.0
-    upper = [e for e in events if e[2] >= split_midi and (e[1] - e[0]) >= min_dur]
+    # v7.8.1: the split is a soft boundary for the melody, not a wall.
+    # It was a hard filter, so a tune that dipped even one semitone below
+    # the cluster boundary simply lost those notes - and in melody-only
+    # mode they were not written to a bass staff either, they were gone.
+    # The melody selector already has a register anchor to keep it home,
+    # so it can safely be shown a margin below the boundary and decide for
+    # itself. The bass line keeps the strict boundary: it has no business
+    # reaching up into the tune.
+    melody_floor = split_midi - MELODY_SPLIT_MARGIN if split_midi else split_midi
+    upper = [e for e in events if e[2] >= melody_floor and (e[1] - e[0]) >= min_dur]
     lower = [e for e in events if e[2] < split_midi and (e[1] - e[0]) >= min_dur]
     print(f"[EXTRACT] split at MIDI {split_midi} (cluster separation {separation:.0f} st): "
-          f"{len(upper)} upper / {len(lower)} lower candidates")
+          f"{len(upper)} melody candidates from MIDI {melody_floor} up / "
+          f"{len(lower)} lower candidates")
 
     # Two passes. The first finds a provisional line; its weighted median
     # pitch is the register the line spends most of its length in, which
@@ -974,6 +1029,14 @@ def _reduce_polyphony_to_two_voices(note_events, min_dur_ms: float = 45.0,
             hist[n.pitch_midi] = hist.get(n.pitch_midi, 0) + 1
         print("[EXTRACT] melody pitch histogram: "
               + " ".join(f"{p}x{c}" for p, c in sorted(hist.items())))
+        durs = sorted(round((n.end - n.start) * 1000) for n in rh)
+        dh = {}
+        for d in durs:
+            dh[d] = dh.get(d, 0) + 1
+        top = sorted(dh.items(), key=lambda kv: -kv[1])[:8]
+        print(f"[EXTRACT] melody durations: median {durs[len(durs)//2]} ms, "
+              f"{min(durs)}-{max(durs)} ms, commonest "
+              + " ".join(f"{d}ms x{c}" for d, c in top))
     return sorted(rh + lh, key=lambda n: n.start)
 
 def extract_melody_basic_pitch(file_path, y: np.ndarray, sr: int) -> TranscriptionResult:
