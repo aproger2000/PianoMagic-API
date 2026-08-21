@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>PianoMagic v7.8.2 — Audio to Piano Score</title>
+    <title>PianoMagic v7.9.0 — Audio to Piano Score</title>
     <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -11,7 +11,7 @@
         <header>
             <h1>🎹 PianoMagic</h1>
             <p class="subtitle">Audio → Piano Score Transcription</p>
-            <span class="version-badge">v7.8.2</span>
+            <span class="version-badge">v7.9.0</span>
         </header>
 
         <div class="upload-section" id="uploadSection">
@@ -89,16 +89,6 @@
                         <span class="metric-value" id="overallCorr">—</span>
                     </div>
                 </div>
-                <div class="chroma-charts">
-                    <div class="chroma-chart">
-                        <h4>Оригинал</h4>
-                        <canvas id="chromaOrigCanvas" width="360" height="140"></canvas>
-                    </div>
-                    <div class="chroma-chart">
-                        <h4>Синтез</h4>
-                        <canvas id="chromaSynthCanvas" width="360" height="140"></canvas>
-                    </div>
-                </div>
             </div>
 
             <div class="staff-container">
@@ -126,6 +116,7 @@
                 <h3>🔊 Результат синтеза</h3>
                 <audio id="audioPlayer" controls></audio>
                 <div class="download-buttons">
+                    <a id="downloadPdf" class="btn-download btn-primary-download hidden" href="#" download>⬇️ Скачать PDF (ноты)</a>
                     <a id="downloadWav" class="btn-download" href="#" download>⬇️ Скачать WAV</a>
                     <a id="downloadXml" class="btn-download" href="#" download>⬇️ Скачать MusicXML</a>
                 </div>
@@ -149,7 +140,7 @@
         <footer>
             <div class="footer-content">
                 <div class="footer-left">
-                    <span class="footer-version">Frontend: <strong id="feVersion">v7.8.2</strong></span>
+                    <span class="footer-version">Frontend: <strong id="feVersion">v7.9.0</strong></span>
                     <span class="footer-separator">|</span>
                     <span class="footer-version">Backend: <strong id="beVersion">—</strong></span>
                 </div>

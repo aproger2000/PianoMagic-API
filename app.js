@@ -1,6 +1,6 @@
-/* PianoMagic Frontend — v7.8.2 */
+/* PianoMagic Frontend — v7.9.0 */
 
-const FE_VERSION = '7.8.2';
+const FE_VERSION = '7.9.0';
 const API_BASE = 'https://pianomagic-api.onrender.com';
 
 // State
@@ -302,12 +302,6 @@ function showResults(result) {
     document.getElementById('onsetCorr').textContent = comp.onset_correlation !== undefined ? comp.onset_correlation.toFixed(3) : '—';
     document.getElementById('overallCorr').textContent = comp.overall_similarity !== undefined ? comp.overall_similarity.toFixed(3) : '—';
 
-    // Chroma charts
-    if (comp.chroma_orig && comp.chroma_synth) {
-        drawChromaChart('chromaOrigCanvas', comp.chroma_orig, '#4a90d9');
-        drawChromaChart('chromaSynthCanvas', comp.chroma_synth, '#e74c3c');
-    }
-
     notes = result.notes || [];
     currentDuration = result.duration || 0;
     totalTimeEl.textContent = formatTime(currentDuration);
@@ -317,6 +311,18 @@ function showResults(result) {
     const xmlUrl = result.xml_url ? `${API_BASE}${result.xml_url}` : '#';
     document.getElementById('downloadWav').href = wavUrl;
     document.getElementById('downloadXml').href = xmlUrl;
+
+    // The PDF is the readable score, so it leads - but only when the
+    // engraver actually produced one. A dead download button is worse
+    // than no button, and pdf_error says in the log why it is missing.
+    const pdfLink = document.getElementById('downloadPdf');
+    if (result.pdf_url) {
+        pdfLink.href = `${API_BASE}${result.pdf_url}`;
+        pdfLink.classList.remove('hidden');
+    } else {
+        pdfLink.classList.add('hidden');
+        if (result.pdf_error) console.warn('[PianoMagic] PDF not produced:', result.pdf_error);
+    }
 
     // Say plainly which engine produced this result. The neural engine
     // can import fine and still fail per request, in which case the notes
@@ -337,36 +343,6 @@ function showResults(result) {
 
     resizeStaff();
     autoZoom();
-}
-
-function drawChromaChart(canvasId, data, color) {
-    const canvas = document.getElementById(canvasId);
-    if (!canvas || !data || data.length !== 12) return;
-    const ctx = canvas.getContext('2d');
-    const dpr = window.devicePixelRatio || 1;
-    const w = canvas.width / dpr;
-    const h = canvas.height / dpr;
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    ctx.scale(dpr, dpr);
-
-    const labels = ['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
-    const maxVal = Math.max(...data, 0.001);
-    const barW = (w - 40) / 12;
-    const barMaxH = h - 30;
-
-    data.forEach((val, i) => {
-        const barH = (val / maxVal) * barMaxH;
-        const x = 20 + i * barW;
-        const y = h - 20 - barH;
-        ctx.fillStyle = color;
-        ctx.globalAlpha = 0.8;
-        ctx.fillRect(x + 2, y, barW - 4, barH);
-        ctx.globalAlpha = 1;
-        ctx.fillStyle = '#555';
-        ctx.font = '10px sans-serif';
-        ctx.textAlign = 'center';
-        ctx.fillText(labels[i], x + barW/2, h - 5);
-    });
 }
 
 // ─────────────────────────────────────────────

@@ -13,13 +13,14 @@ versions. This prints numbers instead, in about a minute, and the mono
 vs poly pair says whether a loss comes from polyphony or from the
 pipeline itself.
 
-Standard library only - it has to run wherever the service is reachable.
+Standard library only, numpy included - it has to run wherever the
+service is reachable, with nothing installed first.
 """
 import argparse, json, mimetypes, os, sys, time, urllib.request, urllib.error, uuid, wave
+from array import array
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import numpy as np
 import reference as R
 import score as S
 
@@ -27,9 +28,12 @@ DEFAULT_API = "https://pianomagic-api.onrender.com"
 
 
 def write_wav(path, y, sr=R.SR):
+    pcm = array('h', (int(max(-1.0, min(1.0, v)) * 32767) for v in y))
+    if sys.byteorder == 'big':
+        pcm.byteswap()
     with wave.open(str(path), 'wb') as f:
         f.setnchannels(1); f.setsampwidth(2); f.setframerate(sr)
-        f.writeframes((np.clip(y, -1, 1) * 32767).astype('<i2').tobytes())
+        f.writeframes(pcm.tobytes())
 
 
 def post_file(api, path):

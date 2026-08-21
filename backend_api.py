@@ -1,11 +1,13 @@
 """
-PianoMagic Backend API — v7.8.2
+PianoMagic Backend API — v7.9.0
 Audio-to-piano-score transcription
 """
 
 import os
 import uuid
 import asyncio
+import shutil
+import subprocess
 import tempfile
 import traceback
 from pathlib import Path
@@ -141,7 +143,7 @@ def _get_bp_model():
 # ───────────────────────────────────────────────────────────────
 # Configuration
 # ───────────────────────────────────────────────────────────────
-VERSION = "7.8.2"
+VERSION = "7.9.0"
 
 # How far below the RH/LH cluster boundary the melody selector is still
 # allowed to look. A melodic line does not stop at the boundary a
@@ -173,6 +175,62 @@ tasks: Dict[str, dict] = {}
 # a per-task buffer that the frontend can show and copy, so what actually
 # happened during a run is visible without server access.
 
+# MuseScore is in the image (see the Dockerfile) purely to engrave a
+# score: MusicXML is an interchange format, not something a person can
+# read at a music stand. Names differ between distributions, so probe.
+_MSCORE_CANDIDATES = ("mscore3", "musescore3", "mscore", "musescore",
+                      "MuseScore3", "MuseScore")
+_MSCORE_PATH = None
+_MSCORE_PROBED = False
+
+
+def _find_mscore():
+    global _MSCORE_PATH, _MSCORE_PROBED
+    if _MSCORE_PROBED:
+        return _MSCORE_PATH
+    _MSCORE_PROBED = True
+    for name in _MSCORE_CANDIDATES:
+        found = shutil.which(name)
+        if found:
+            _MSCORE_PATH = found
+            break
+    print(f"[INIT] engraver: {_MSCORE_PATH or 'NOT FOUND - PDF export disabled'}")
+    return _MSCORE_PATH
+
+
+def musicxml_to_pdf(xml_path: Path, pdf_path: Path, timeout: float = 180.0):
+    """
+    Engrave a MusicXML file to PDF. Returns (ok, message).
+
+    Never raises: a score that cannot be engraved must not lose the user
+    their transcription, so a failure here is reported and the MusicXML
+    download stays. MuseScore wants a writable HOME and a display; it
+    gets a scratch HOME and the offscreen Qt platform, which is also set
+    in the image, but setting it here too means the export still works
+    if the service is ever started outside that image.
+    """
+    exe = _find_mscore()
+    if not exe:
+        return False, "no MuseScore binary on PATH"
+    env = dict(os.environ)
+    env['QT_QPA_PLATFORM'] = 'offscreen'
+    with tempfile.TemporaryDirectory() as home:
+        env['HOME'] = home
+        env['XDG_RUNTIME_DIR'] = home
+        try:
+            proc = subprocess.run([exe, '-o', str(pdf_path), str(xml_path)],
+                                  env=env, timeout=timeout,
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        except subprocess.TimeoutExpired:
+            return False, f"{Path(exe).name} timed out after {timeout:.0f}s"
+        except Exception as e:                      # noqa: BLE001
+            return False, f"{Path(exe).name} could not be run: {e}"
+    if pdf_path.exists() and pdf_path.stat().st_size > 0:
+        return True, f"{pdf_path.stat().st_size} bytes"
+    tail = (proc.stdout or b'').decode('utf-8', 'replace').strip().splitlines()[-4:]
+    return False, f"exit {proc.returncode}: " + " | ".join(tail)
+
+
 def _env_report() -> List[str]:
     """Versions and engine state - the first thing worth knowing when a
     run misbehaves, and the thing that's hardest to guess from outside."""
@@ -200,6 +258,7 @@ def _env_report() -> List[str]:
     lines.append(f"basic-pitch importable  : {BASIC_PITCH_AVAILABLE}")
     if _BASIC_PITCH_IMPORT_ERROR:
         lines.append(f"basic-pitch import error: {_BASIC_PITCH_IMPORT_ERROR}")
+    lines.append(f"engraver (MuseScore)    : {_find_mscore() or 'NOT FOUND'}")
     if BASIC_PITCH_AVAILABLE:
         # Which graphs actually ship in this install, and which one we
         # selected. When the engine falls over, this is the difference
@@ -1934,6 +1993,13 @@ async def _process_audio_inner(task_id: str, file_path: Path):
         xml_size = xml_path.stat().st_size if xml_path.exists() else 0
         print(f"[TASK {task_id}] XML saved, size={xml_size} bytes")
 
+        # Engrave. MusicXML is what another program reads; a PDF is what a
+        # person reads. Failure is not fatal - the score still exists as
+        # MusicXML and the run keeps its result.
+        pdf_path = UPLOAD_DIR / f"PianoMagic_{file_id}.pdf"
+        pdf_ok, pdf_msg = musicxml_to_pdf(xml_path, pdf_path)
+        print(f"[TASK {task_id}] PDF {'saved' if pdf_ok else 'NOT produced'}: {pdf_msg}")
+
         # Compare
         try:
             comparison = compare_audio_features(y, synth_audio[:, 0] if synth_audio.ndim > 1 else synth_audio, sr)
@@ -1966,6 +2032,8 @@ async def _process_audio_inner(task_id: str, file_path: Path):
             'comparison': comparison,
             'wav_url': f'/download/{file_id}.wav',
             'xml_url': f'/download/{file_id}.xml',
+            'pdf_url': f'/download/{file_id}.pdf' if pdf_ok else None,
+            'pdf_error': None if pdf_ok else pdf_msg,
             # Which engine actually produced these notes. Reported per
             # result, not just per process, because the neural engine can
             # import cleanly and still fail per request - in which case
@@ -2065,12 +2133,15 @@ async def download_file(file_id: str):
     # first and look up the exact file that was actually written.
     stem = Path(file_id).stem
     requested_ext = Path(file_id).suffix.lower()
-    candidates = [requested_ext] if requested_ext in ('.wav', '.xml') else ['.wav', '.xml']
+    candidates = ([requested_ext] if requested_ext in ('.wav', '.xml', '.pdf')
+                  else ['.wav', '.xml', '.pdf'])
 
     for ext in candidates:
         file_path = UPLOAD_DIR / f"PianoMagic_{stem}{ext}"
         if file_path.exists():
-            media_type = 'audio/wav' if ext == '.wav' else 'application/vnd.recordare.musicxml+xml'
+            media_type = {'.wav': 'audio/wav',
+                          '.pdf': 'application/pdf',
+                          '.xml': 'application/vnd.recordare.musicxml+xml'}[ext]
             return FileResponse(str(file_path), media_type=media_type,
                               filename=f"PianoMagic_{stem}{ext}")
 
