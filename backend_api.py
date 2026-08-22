@@ -1,5 +1,5 @@
 """
-PianoMagic Backend API — v7.11.1
+PianoMagic Backend API — v7.12.0
 Audio-to-piano-score transcription
 """
 
@@ -144,7 +144,7 @@ def _get_bp_model():
 # ───────────────────────────────────────────────────────────────
 # Configuration
 # ───────────────────────────────────────────────────────────────
-VERSION = "7.11.1"
+VERSION = "7.12.0"
 _LAST_RAW_EVENTS = None
 
 # How far below the RH/LH cluster boundary the melody selector is still
@@ -1077,8 +1077,64 @@ def _select_line(cands, jump_weight: float = 0.06, phrase_gap: float = 0.55,
     return trimmed
 
 
+def _drop_stray_pitches(notes: List[Note], min_share: float = 0.01,
+                       min_notes: int = 60) -> List[Note]:
+    """
+    Remove pitches the tune barely uses.
+
+    A melody speaks a small alphabet - a children's song lives on eight
+    or ten pitches. A pitch that turns up once or twice in four hundred
+    notes is not part of that alphabet; it is a detection that survived
+    everything else, and it is what a listener calls "some of the notes
+    are not the tune". Measured on the v7.11.1 melody, a 1% floor removed
+    MIDI 57, 58, 78, 84 and 85 - ten notes of 440 - and on the v7.11.0
+    melody, which did sound like the theme, it removed two. Exactly the
+    asymmetry wanted: it bites on rubbish and leaves a good line alone.
+
+    Skipped on short melodies, where a handful of notes may be all there
+    legitimately is.
+    """
+    if len(notes) < min_notes:
+        return notes
+    from collections import Counter
+    counts = Counter(n.pitch_midi for n in notes)
+    floor = max(2, int(min_share * len(notes)))
+    stray = {p for p, c in counts.items() if c < floor}
+    if not stray:
+        return notes
+    kept = [n for n in notes if n.pitch_midi not in stray]
+    print(f"[EXTRACT] dropped {len(notes) - len(kept)} notes on {len(stray)} "
+          f"pitch(es) the tune barely uses ({sorted(stray)}); "
+          f"{len(counts) - len(stray)} pitches remain")
+    return kept
+
+
+def _melodicity(line):
+    """
+    How much a selected line behaves like a tune rather than an
+    accompaniment part. A melody moves, mostly by step; a chordal inner
+    voice sits on one pitch and an overtone trail leaps by octaves.
+
+    This is the only measure in the pipeline that tracks what a listener
+    reports, so it is what decisions are made on. Returns (score, stats).
+    """
+    if len(line) < 8:
+        return -1e9, "too short"
+    ps = [p for (_s, _e, p, _a) in line]
+    jumps = [abs(b - a) for a, b in zip(ps, ps[1:])]
+    n = float(len(jumps))
+    rep = sum(1 for j in jumps if j == 0) / n
+    step = sum(1 for j in jumps if 1 <= j <= 2) / n
+    oct_ = sum(1 for j in jumps if j >= 12) / n
+    score = step - 0.5 * rep - 1.0 * oct_
+    return score, (f"{len(line)} notes, MIDI {min(ps)}-{max(ps)}, "
+                   f"{100*rep:.0f}% repeat / {100*step:.0f}% stepwise / "
+                   f"{100*oct_:.0f}% octave+, melodicity {score:+.3f}")
+
+
 def _reduce_polyphony_to_two_voices(note_events, min_dur_ms: float = 45.0,
-                                    amp_frac_of_peak: float = 0.05):
+                                    amp_frac_of_peak: float = 0.05,
+                                    quick: bool = False):
     """
     v7.6.0: turn Basic Pitch's polyphonic note list into the two
     monophonic voices a two-staff piano score can actually represent.
@@ -1180,24 +1236,6 @@ def _reduce_polyphony_to_two_voices(note_events, min_dur_ms: float = 45.0,
               f"(pass 1: {len(first)} notes -> pass 2: {len(second)} notes)")
         return second, center
 
-    def _melodicity(line):
-        """How much the selected line behaves like a tune rather than an
-        accompaniment part. A melody moves, mostly by step; a chordal
-        inner voice sits on one pitch and an overtone trail leaps by
-        octaves. Returns (score, stats-string)."""
-        if len(line) < 8:
-            return -1e9, "too short"
-        ps = [p for (_s, _e, p, _a) in line]
-        jumps = [abs(b - a) for a, b in zip(ps, ps[1:])]
-        n = float(len(jumps))
-        rep = sum(1 for j in jumps if j == 0) / n
-        step = sum(1 for j in jumps if 1 <= j <= 2) / n
-        oct_ = sum(1 for j in jumps if j >= 12) / n
-        score = step - 0.5 * rep - 1.0 * oct_
-        return score, (f"{len(line)} notes, MIDI {min(ps)}-{max(ps)}, "
-                       f"{100*rep:.0f}% repeat / {100*step:.0f}% stepwise / "
-                       f"{100*oct_:.0f}% octave+, melodicity {score:+.3f}")
-
     def pick_melody(cands):
         """
         v7.8.2. The melody pass used to run at a fixed pitch_bias of 0,
@@ -1236,6 +1274,13 @@ def _reduce_polyphony_to_two_voices(note_events, min_dur_ms: float = 45.0,
         print(f"[EXTRACT] melody: chose pitch_bias {bias:.3f} "
               f"(melodicity {score:+.3f}, best {top:+.3f})")
         return line, center
+
+    if quick:
+        # Cheap probe used to compare detector settings: one bias, no
+        # second opinion. Enough to score a candidate cloud, far cheaper
+        # than the full reduction run five times over.
+        line, _c = two_pass(upper, 0.0, "probe")
+        return line
 
     mel, mel_center = pick_melody(upper)
 
@@ -1277,6 +1322,8 @@ def _reduce_polyphony_to_two_voices(note_events, min_dur_ms: float = 45.0,
     rh = [Note(start=s, end=e, pitch_midi=p, hand="RH") for (s, e, p, _a) in mel]
     if mel_center is not None:
         rh = _collapse_octave_duplicates(rh, mel_center)
+
+    rh = _drop_stray_pitches(rh)
 
     if MELODY_ONLY:
         print("[EXTRACT] melody-only mode: bass line not transcribed")
@@ -1380,9 +1427,25 @@ def extract_melody_basic_pitch(file_path, y: np.ndarray, sr: int) -> Transcripti
         # gets tightened until its detection rate is physically possible
         # for a keyboard. Each attempt is logged with its numbers, so
         # even a run that never reaches the target says what it saw.
-        note_events = []
-        for attempt, (onset_t, frame_t) in enumerate(BP_THRESHOLD_LADDER, 1):
-            _model_out, _midi, note_events = _bp_predict(
+        # Try every setting and keep the one whose MELODY comes out best.
+        #
+        # v7.11.1 chose by attack rate instead - a proxy for "does this
+        # look like keyboard playing" - and got it exactly backwards. It
+        # accepted 0.45/0.32 because the rate target was met there, and
+        # the melody went from +0.074 to -0.051: 422 notes instead of
+        # 230, stepwise motion down from 29% to 15%. The listener's
+        # verdict was "too many notes and some of them are not the tune",
+        # which is what those numbers say too.
+        #
+        # Melodicity is the one measure that has tracked what a listener
+        # reports, so the choice is made on it directly. Over-tightening
+        # is self-correcting here: strip real notes out of a tune and the
+        # gaps turn steps into leaps, which the score punishes.
+        #
+        # The attack rate stays in the log as a description, not a rule.
+        best_events, best_score, best_setting = None, -1e18, None
+        for onset_t, frame_t in BP_THRESHOLD_LADDER:
+            _model_out, _midi, candidate = _bp_predict(
                 str(tmp_wav),
                 model,
                 # A0-C7: the practical piano range. Bounding it keeps
@@ -1394,23 +1457,22 @@ def extract_melody_basic_pitch(file_path, y: np.ndarray, sr: int) -> Transcripti
                 minimum_note_length=58.0,
                 melodia_trick=True,
             )
-            attacks = _attack_rate(note_events, duration)
-            density = _onset_density(note_events, duration)
-            smear = _octave_smear(note_events)
+            attacks = _attack_rate(candidate, duration)
+            smear = _octave_smear(candidate)
+            try:
+                probe = _reduce_polyphony_to_two_voices(candidate, quick=True)
+                score, stats = _melodicity(probe)
+            except Exception as exc:                # noqa: BLE001
+                score, stats = -1e18, f"probe failed: {exc}"
             print(f"[EXTRACT] onset {onset_t:.2f} / frame {frame_t:.2f}: "
-                  f"{len(note_events)} events, {attacks:.0f} attacks/s "
-                  f"({density:.0f} events/s), {smear} pitch classes over 3+ octaves")
-            if attacks <= ATTACK_RATE_TARGET:
-                if attempt > 1:
-                    print(f"[EXTRACT] tightened {attempt - 1} step(s) to reach a "
-                          f"plausible attack rate (target <={ATTACK_RATE_TARGET:.0f}/s)")
-                break
-            if attempt < len(BP_THRESHOLD_LADDER):
-                print(f"[EXTRACT] more attacks than the music can contain "
-                      f"(target <={ATTACK_RATE_TARGET:.0f}/s) - tightening")
-            else:
-                print(f"[EXTRACT] still above target at the strictest setting; "
-                      f"keeping this result")
+                  f"{len(candidate)} events, {attacks:.0f} attacks/s, "
+                  f"{smear} classes over 3+ octaves -> {stats}")
+            if score > best_score:
+                best_events, best_score, best_setting = candidate, score, (onset_t, frame_t)
+        note_events = best_events or []
+        if best_setting:
+            print(f"[EXTRACT] detector: chose onset {best_setting[0]:.2f} / "
+                  f"frame {best_setting[1]:.2f} (melodicity {best_score:+.3f})")
     finally:
         # The scratch WAV is ours; it must go whether or not the model
         # succeeded, and whether or not the ladder ran to the end.
