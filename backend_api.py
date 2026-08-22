@@ -1,5 +1,5 @@
 """
-PianoMagic Backend API — v7.11.0
+PianoMagic Backend API — v7.11.1
 Audio-to-piano-score transcription
 """
 
@@ -144,7 +144,7 @@ def _get_bp_model():
 # ───────────────────────────────────────────────────────────────
 # Configuration
 # ───────────────────────────────────────────────────────────────
-VERSION = "7.11.0"
+VERSION = "7.11.1"
 _LAST_RAW_EVENTS = None
 
 # How far below the RH/LH cluster boundary the melody selector is still
@@ -242,18 +242,53 @@ def musicxml_to_pdf(xml_path: Path, pdf_path: Path, timeout: float = 180.0):
 # second (17 per beat at 99 BPM - nothing plays that) and 7 pitch classes
 # appearing in three or more octaves at once. A note at F2 does not
 # produce real notes at F3, F4 and F5; it produces partials there.
-DENSITY_TARGET = 10.0          # onsets per second we are willing to accept
-SMEAR_TARGET = 2               # pitch classes spread over 3+ octaves
+# Whether a detection cloud is even shaped like keyboard playing.
+#
+# The first version of this counted note EVENTS per second and called 28
+# impossible. That was overstated: 28 events a second on the test file is
+# 14 distinct attacks carrying about two notes each, and a pianist
+# playing sixteenths in both hands does produce a lot of events. What is
+# not plausible is the ATTACK rate - sixteenths at 99 BPM are 6.6 a
+# second, so 14 is still roughly double what the music can contain, and
+# the surplus is the detector re-triggering on partials and pedal wash.
+# Counting attacks rather than events is the honest measure, so that is
+# what gates the ladder now.
+#
+# Octave smear stays as a diagnostic only. It never fell below 6 on the
+# real file even at the strictest setting, because a pedalled piano
+# genuinely does put a note's partials into the microphone; gating on it
+# forced the ladder to its last rung every time, which is what started
+# dropping real notes.
+ATTACK_RATE_TARGET = 8.0       # distinct attacks per second we accept
+ATTACK_FUSE = 0.03             # notes struck within 30 ms are one attack
 
-# Sensitive first, because a thin recording genuinely needs it; each rung
-# is tried only when the previous one produced something no keyboard
-# could have played.
-BP_THRESHOLD_LADDER = ((0.35, 0.25), (0.55, 0.40), (0.70, 0.50))
+# Finer than before, so a dense file is tightened only as far as it needs
+# rather than jumping to the strictest setting available.
+BP_THRESHOLD_LADDER = ((0.35, 0.25), (0.45, 0.32), (0.55, 0.40),
+                       (0.65, 0.45), (0.75, 0.55))
+
+
+def _attack_rate(events, duration: float, fuse: float = ATTACK_FUSE) -> float:
+    """Median distinct attacks per second. Notes struck together are one
+    attack, which is what a player's hands actually produce."""
+    if not events or duration <= 0:
+        return 0.0
+    starts = sorted(float(ev[0]) for ev in events)
+    buckets = [0] * (int(duration) + 1)
+    last = -1e9
+    for s in starts:
+        if s - last > fuse:
+            last = s
+            i = int(s)
+            if 0 <= i < len(buckets):
+                buckets[i] += 1
+    buckets.sort()
+    return float(buckets[len(buckets) // 2])
 
 
 def _onset_density(events, duration: float) -> float:
-    """Median onsets per second, so a couple of busy bars cannot speak
-    for the whole piece."""
+    """Median note events per second - kept alongside the attack rate so
+    the two can be compared in the log."""
     if not events or duration <= 0:
         return 0.0
     buckets = [0] * (int(duration) + 1)
@@ -1359,20 +1394,20 @@ def extract_melody_basic_pitch(file_path, y: np.ndarray, sr: int) -> Transcripti
                 minimum_note_length=58.0,
                 melodia_trick=True,
             )
+            attacks = _attack_rate(note_events, duration)
             density = _onset_density(note_events, duration)
             smear = _octave_smear(note_events)
             print(f"[EXTRACT] onset {onset_t:.2f} / frame {frame_t:.2f}: "
-                  f"{len(note_events)} events, {density:.0f} onsets/s, "
-                  f"{smear} pitch classes smeared over 3+ octaves")
-            if density <= DENSITY_TARGET and smear <= SMEAR_TARGET:
+                  f"{len(note_events)} events, {attacks:.0f} attacks/s "
+                  f"({density:.0f} events/s), {smear} pitch classes over 3+ octaves")
+            if attacks <= ATTACK_RATE_TARGET:
                 if attempt > 1:
-                    print(f"[EXTRACT] tightened {attempt - 1} step(s) to get a "
-                          f"physically plausible detection rate")
+                    print(f"[EXTRACT] tightened {attempt - 1} step(s) to reach a "
+                          f"plausible attack rate (target <={ATTACK_RATE_TARGET:.0f}/s)")
                 break
             if attempt < len(BP_THRESHOLD_LADDER):
-                print(f"[EXTRACT] too dense for a keyboard "
-                      f"(target <={DENSITY_TARGET:.0f}/s, <={SMEAR_TARGET} smeared) "
-                      f"- retrying with stricter thresholds")
+                print(f"[EXTRACT] more attacks than the music can contain "
+                      f"(target <={ATTACK_RATE_TARGET:.0f}/s) - tightening")
             else:
                 print(f"[EXTRACT] still above target at the strictest setting; "
                       f"keeping this result")
