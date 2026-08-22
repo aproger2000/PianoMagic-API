@@ -6,14 +6,20 @@ impression - "closer", "mush", "notes missing". Those cost a deploy cycle
 each and cannot be compared across versions. A reference whose note list
 we wrote ourselves can be scored by machine, in seconds, to one decimal.
 
-Two renderings of the SAME melody are produced:
+Renderings of the SAME melody, hardening one property at a time:
 
-    mono - the tune alone
-    poly - the identical tune under a left hand playing bass and chords
+    mono    - the tune alone
+    poly    - plus a left hand of bass and chords, well below the tune
+    overlap - the left hand raised until it nearly touches the melody
+    pedal   - plus sustain: notes ring on into each other
+    figured - plus broken-chord figuration in the melody's own register
 
-so the one variable between them is polyphony. If mono scores well and
-poly does not, the loss is caused by the accompaniment and by nothing
-else; the pair settles that question without a listening test.
+Only one thing changes per rung, so whichever rung the score falls off
+names the property responsible. The first two rungs measured F1 0.91 and
+0.80 with the melody's pitch alphabet recovered exactly - the pipeline
+handles a clean line and simple accompaniment. Something in the real
+recording is harder than either, and this ladder is how to find out
+what, instead of guessing at it one deploy at a time.
 
 The melody is "В траве сидел кузнечик" as the reference chart writes it:
 1=C 3=E 4=F 5=G, and 5|6 the black key between G and A, i.e. G#.
@@ -100,30 +106,62 @@ def _mix(y, w, at):
         y[i + k] += v
 
 
-def render(with_accompaniment: bool):
+CASES = ('mono', 'poly', 'overlap', 'pedal', 'figured')
+
+
+def render(case='mono'):
+    """Render one rung of the ladder. `case` may also be a bool for the
+    old two-way call: False -> mono, True -> poly."""
+    if isinstance(case, bool):
+        case = 'poly' if case else 'mono'
+    if case not in CASES:
+        raise ValueError(f"unknown case {case!r}; expected one of {CASES}")
+    accomp = case != 'mono'
+    # Sustain makes every note ring into the next instead of dying away.
+    # It is the property most likely to matter: the real recording shows
+    # 13-25 strong partials per frame, which is what a pedalled piano
+    # looks like and a dry one does not.
+    decay_mel = 0.7 if case in ('pedal', 'figured') else 2.2
+    decay_acc = 0.5 if case in ('pedal', 'figured') else 1.4
+    # Raised left hand: its top note sits a semitone under the tune's
+    # lowest, so the hands nearly touch and pitch order stops separating
+    # them - the situation the real arrangement is in.
+    if case == 'mono' or case == 'poly':
+        prog = [(41, [48, 53]), (36, [43, 48])]
+    else:
+        prog = [(53, [56, 59]), (48, [55, 59])]
+
     notes = melody()
     end = max(s + d for s, d, _ in notes) + 1.2
     y = array('d', bytes(8 * int(end * SR)))
     for start, dur, midi in notes:
-        _mix(y, _tone(midi, dur, 1.0), start)
+        _mix(y, _tone(midi, dur, 1.0, decay=decay_mel), start)
 
-    if with_accompaniment:
+    if accomp:
         # The left hand sits strictly BELOW the tune (which lives at
         # 60-68) and plays bass-on-the-beat, chord-on-the-offbeat. Only
         # fifths and octaves: the accompaniment must never double a
         # melody pitch, or the two parts stop being separable even by
         # ear - an earlier draft put C4 and F4 in the chords and it
         # sounded like the melody echoing itself.
-        prog = [(41, [48, 53]), (36, [43, 48])]      # F / C
         last = max(s + d for s, d, _ in notes)
         t, k = 0.0, 0
         while t < last:
             bass, chord = prog[(int(t / (2 * BEAT))) % 2]
-            if k % 2 == 0:
-                _mix(y, _tone(bass, E * BEAT, 1.10, decay=1.4), t)
+            if case == 'figured':
+                # Broken chords in sixteenths, right under the tune: the
+                # accompaniment now moves as much as the melody does, so
+                # "the part that moves" stops identifying the melody.
+                seq = [bass] + chord + [chord[-1]]
+                _mix(y, _tone(seq[k % len(seq)], E * BEAT / 2, 0.85,
+                              decay=decay_acc), t)
+                _mix(y, _tone(seq[(k + 1) % len(seq)], E * BEAT / 2, 0.85,
+                              decay=decay_acc), t + E * BEAT / 2)
+            elif k % 2 == 0:
+                _mix(y, _tone(bass, E * BEAT, 1.10, decay=decay_acc), t)
             else:
                 for c in chord:
-                    _mix(y, _tone(c, E * BEAT, 0.62, decay=2.4), t)
+                    _mix(y, _tone(c, E * BEAT, 0.62, decay=decay_acc + 1.0), t)
             t += E * BEAT
             k += 1
 

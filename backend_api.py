@@ -1,5 +1,5 @@
 """
-PianoMagic Backend API — v7.10.1
+PianoMagic Backend API — v7.11.0
 Audio-to-piano-score transcription
 """
 
@@ -144,7 +144,7 @@ def _get_bp_model():
 # ───────────────────────────────────────────────────────────────
 # Configuration
 # ───────────────────────────────────────────────────────────────
-VERSION = "7.10.1"
+VERSION = "7.11.0"
 _LAST_RAW_EVENTS = None
 
 # How far below the RH/LH cluster boundary the melody selector is still
@@ -231,6 +231,49 @@ def musicxml_to_pdf(xml_path: Path, pdf_path: Path, timeout: float = 180.0):
         return True, f"{pdf_path.stat().st_size} bytes"
     tail = (proc.stdout or b'').decode('utf-8', 'replace').strip().splitlines()[-4:]
     return False, f"exit {proc.returncode}: " + " | ".join(tail)
+
+
+# How dense a detection cloud is, and how badly it is smeared across
+# octaves. Both are measured on the raw model output, before anything of
+# ours touches it, because they say whether the DETECTOR is set right -
+# no amount of later selection can rescue a cloud that is wrong here.
+#
+# Measured on the real test file at onset 0.35 / frame 0.25: 28 onsets a
+# second (17 per beat at 99 BPM - nothing plays that) and 7 pitch classes
+# appearing in three or more octaves at once. A note at F2 does not
+# produce real notes at F3, F4 and F5; it produces partials there.
+DENSITY_TARGET = 10.0          # onsets per second we are willing to accept
+SMEAR_TARGET = 2               # pitch classes spread over 3+ octaves
+
+# Sensitive first, because a thin recording genuinely needs it; each rung
+# is tried only when the previous one produced something no keyboard
+# could have played.
+BP_THRESHOLD_LADDER = ((0.35, 0.25), (0.55, 0.40), (0.70, 0.50))
+
+
+def _onset_density(events, duration: float) -> float:
+    """Median onsets per second, so a couple of busy bars cannot speak
+    for the whole piece."""
+    if not events or duration <= 0:
+        return 0.0
+    buckets = [0] * (int(duration) + 1)
+    for ev in events:
+        i = int(float(ev[0]))
+        if 0 <= i < len(buckets):
+            buckets[i] += 1
+    buckets.sort()
+    return float(buckets[len(buckets) // 2])
+
+
+def _octave_smear(events, min_count: int = 10) -> int:
+    """How many pitch classes appear in three or more octaves at once."""
+    from collections import Counter, defaultdict
+    counts = Counter(int(ev[2]) for ev in events)
+    octaves = defaultdict(set)
+    for pitch, n in counts.items():
+        if n >= min_count:
+            octaves[pitch % 12].add(pitch // 12)
+    return sum(1 for octs in octaves.values() if len(octs) >= 3)
 
 
 def _env_report() -> List[str]:
@@ -1284,31 +1327,63 @@ def extract_melody_basic_pitch(file_path, y: np.ndarray, sr: int) -> Transcripti
     try:
         sf.write(str(tmp_wav), y, sr, subtype='PCM_16')
         print(f"[EXTRACT] Running Basic Pitch on {tmp_wav.name} ({duration:.1f}s)...")
-        _model_out, _midi, note_events = _bp_predict(
-            str(tmp_wav),
-            model,
-            # A0-C7: the practical piano range. Bounding it keeps sub-bass
-            # rumble and cymbal-region artefacts out of the note list.
-            minimum_frequency=float(librosa.note_to_hz('A0')),
-            maximum_frequency=float(librosa.note_to_hz('C7')),
-            # v7.8.0 - "widen what the model is allowed to hear".
-            # These were left at their defaults (onset 0.5 / frame 0.3),
-            # which are tuned for clean solo instrument recordings. On a
-            # sung line inside an arrangement they discard exactly the
-            # quieter, shorter notes a listener still hears as part of
-            # the tune, which is what "several notes are missing" means.
-            # 90 ms also refuses anything shorter than a sixteenth here
-            # (a sixteenth at 99 BPM is 151 ms, a thirty-second 76 ms).
-            onset_threshold=0.35,
-            frame_threshold=0.25,
-            minimum_note_length=58.0,
-            melodia_trick=True,
-        )
+        # Ask the model, then check whether the answer is even shaped
+        # like music, and tighten if it is not.
+        #
+        # v7.8.0 lowered these to 0.35/0.25 to stop the model discarding
+        # quiet short notes - the "several notes are missing" complaint.
+        # That was right for a thin recording and wrong for a dense one:
+        # on the pedalled piano arrangement it returned 28 onsets a
+        # second across five and a half octaves, with every strong pitch
+        # class present in three or four octaves at once. Nothing later
+        # in the pipeline can recover a melody from that, and measuring
+        # it offline confirmed no filter can either - the partials are as
+        # loud and as long as the notes.
+        #
+        # So the thresholds are chosen per recording rather than fixed.
+        # A sparse file keeps the sensitive setting it needs; a dense one
+        # gets tightened until its detection rate is physically possible
+        # for a keyboard. Each attempt is logged with its numbers, so
+        # even a run that never reaches the target says what it saw.
+        note_events = []
+        for attempt, (onset_t, frame_t) in enumerate(BP_THRESHOLD_LADDER, 1):
+            _model_out, _midi, note_events = _bp_predict(
+                str(tmp_wav),
+                model,
+                # A0-C7: the practical piano range. Bounding it keeps
+                # sub-bass rumble and cymbal-region artefacts out.
+                minimum_frequency=float(librosa.note_to_hz('A0')),
+                maximum_frequency=float(librosa.note_to_hz('C7')),
+                onset_threshold=onset_t,
+                frame_threshold=frame_t,
+                minimum_note_length=58.0,
+                melodia_trick=True,
+            )
+            density = _onset_density(note_events, duration)
+            smear = _octave_smear(note_events)
+            print(f"[EXTRACT] onset {onset_t:.2f} / frame {frame_t:.2f}: "
+                  f"{len(note_events)} events, {density:.0f} onsets/s, "
+                  f"{smear} pitch classes smeared over 3+ octaves")
+            if density <= DENSITY_TARGET and smear <= SMEAR_TARGET:
+                if attempt > 1:
+                    print(f"[EXTRACT] tightened {attempt - 1} step(s) to get a "
+                          f"physically plausible detection rate")
+                break
+            if attempt < len(BP_THRESHOLD_LADDER):
+                print(f"[EXTRACT] too dense for a keyboard "
+                      f"(target <={DENSITY_TARGET:.0f}/s, <={SMEAR_TARGET} smeared) "
+                      f"- retrying with stricter thresholds")
+            else:
+                print(f"[EXTRACT] still above target at the strictest setting; "
+                      f"keeping this result")
     finally:
+        # The scratch WAV is ours; it must go whether or not the model
+        # succeeded, and whether or not the ladder ran to the end.
         try:
             tmp_wav.unlink(missing_ok=True)
         except Exception:
             pass
+
     print(f"[EXTRACT] Basic Pitch returned {len(note_events)} note events")
 
     global _LAST_RAW_EVENTS

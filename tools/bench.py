@@ -77,13 +77,17 @@ def transcribe(api, audio_path, poll=3.0, limit=900):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--api', default=os.environ.get('PIANOMAGIC_API', DEFAULT_API))
-    ap.add_argument('--case', choices=['mono', 'poly', 'both'], default='both')
+    ap.add_argument('--case', choices=list(R.CASES) + ['both', 'all'],
+                    default='all',
+                    help="'all' walks the hardening ladder; 'both' is just mono+poly")
     ap.add_argument('--keep', metavar='DIR', help='keep audio, XML and run logs here')
     args = ap.parse_args()
 
     out = Path(args.keep) if args.keep else Path('.bench_tmp')
     out.mkdir(parents=True, exist_ok=True)
-    cases = ['mono', 'poly'] if args.case == 'both' else [args.case]
+    cases = (list(R.CASES) if args.case == 'all'
+             else ['mono', 'poly'] if args.case == 'both'
+             else [args.case])
     ref = R.melody()
     print(f"reference: {len(ref)} notes, "
           f"{max(s+d for s,d,_ in ref):.1f}s, MIDI {min(p for _,_,p in ref)}-"
@@ -93,7 +97,7 @@ def main():
     results = {}
     for case in cases:
         wav = out / f"reference_{case}.wav"
-        write_wav(wav, R.render(case == 'poly'))
+        write_wav(wav, R.render(case))
         print(f"[{case}] {wav.name} -> transcribing")
         task, res = transcribe(args.api, wav)
         xml_path = out / f"result_{case}.xml"
@@ -112,21 +116,26 @@ def main():
                               f"tempo={st['tempo']}", st))
         print()
 
-    if len(results) == 2:
-        m, p = results['mono'], results['poly']
-        print("verdict")
-        print(f"  F1       mono {m['f1']:.2f} -> poly {p['f1']:.2f}   "
-              f"({p['f1']-m['f1']:+.2f})")
-        print(f"  contour  mono {m['contour']*100:.0f}% -> poly {p['contour']*100:.0f}%  "
-              f"({(p['contour']-m['contour'])*100:+.0f} pp)")
-        if m['f1'] >= 0.8 and p['f1'] < 0.5:
-            print("  -> the pipeline handles a single line; the accompaniment is what breaks it.")
-        elif m['f1'] < 0.8:
-            print("  -> even a clean solo line is not transcribed correctly; "
-                  "the fault is in the pipeline, not in polyphony.")
-        else:
-            print("  -> both cases behave; whatever breaks the real recording is "
-                  "not reproduced by this reference.")
+    if len(results) > 1:
+        print("ladder")
+        prev = None
+        worst = None
+        for case in cases:
+            r = results.get(case)
+            if not r:
+                continue
+            delta = "" if prev is None else f"   ({r['f1'] - prev:+.2f})"
+            print(f"  {case:8s} F1 {r['f1']:.2f}  contour {r['contour']*100:3.0f}%"
+                  f"  spurious {r['spurious']:3d}{delta}")
+            if prev is not None and prev - r['f1'] > 0.15 and worst is None:
+                worst = case
+            prev = r['f1']
+        if worst:
+            print(f"  -> the score falls off at '{worst}'; that property is "
+                  f"what the pipeline cannot handle.")
+        elif prev is not None and prev >= 0.7:
+            print("  -> every rung holds. Whatever breaks the real recording "
+                  "is still not reproduced here.")
 
     (out / 'bench.json').write_text(json.dumps(results, indent=2))
     print(f"\nwritten to {out}/")
