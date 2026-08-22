@@ -37,5 +37,11 @@ run("clean three voices",        16)
 run("legato 60 ms",              16, overlap=0.06)
 run("harmonic partials",         10, partials=True)
 run("partials + legato",         10, partials=True, overlap=0.06)
-run("partials + legato + junk",   5, partials=True, overlap=0.06, spurious=20)
+run("partials + legato + junk",  12, partials=True, overlap=0.06, spurious=20)
+run("heavier junk",              12, partials=True, overlap=0.06, spurious=40)
+# Known limit, kept as documentation rather than a target: past roughly
+# 80 stray detections the junk is dense enough to form a substantial
+# voice of its own and the salience gate no longer saves it. That is the
+# point where the note data, not the separation, has to be fixed.
+run("junk beyond the gate's reach", 0, partials=True, overlap=0.06, spurious=80)
 print("\nALL GOOD" if ok else "\nSOMETHING FAILED")

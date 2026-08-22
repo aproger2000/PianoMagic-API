@@ -1,5 +1,5 @@
 """
-PianoMagic Backend API — v7.10.0
+PianoMagic Backend API — v7.10.1
 Audio-to-piano-score transcription
 """
 
@@ -144,7 +144,7 @@ def _get_bp_model():
 # ───────────────────────────────────────────────────────────────
 # Configuration
 # ───────────────────────────────────────────────────────────────
-VERSION = "7.10.0"
+VERSION = "7.10.1"
 _LAST_RAW_EVENTS = None
 
 # How far below the RH/LH cluster boundary the melody selector is still

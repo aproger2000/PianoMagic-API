@@ -153,11 +153,35 @@ def separate(notes: Sequence[Note], tol: float = 0.08) -> List[int]:
 
 
 def top_voice(notes: Sequence[Note], tol: float = 0.08,
-              min_share: float = 0.12) -> List[int]:
-    """Indices of the notes belonging to the highest substantial voice."""
-    vid = separate(notes, tol)
-    if not vid:
+              min_share: float = 0.12, min_salience: float = 0.35) -> List[int]:
+    """
+    Indices of the notes belonging to the highest substantial voice.
+
+    Separation is purely combinatorial - it counts what is sounding and
+    orders it by pitch, and knows nothing about loudness. A partial that
+    harmonic suppression damped to a quarter of its weight is, to this
+    code, exactly as much a note as the tune. On the real run that is
+    what happened: the top voice climbed to MIDI 89 on a trail of
+    partials and scored 16% octave leaps. So the faint stuff is removed
+    before separation rather than left to form voices of its own;
+    min_salience is a fraction of the median note salience.
+    """
+    if not notes:
         return []
+    sal = sorted((e - s) * a for s, e, _p, a in notes)
+    floor_sal = min_salience * sal[len(sal) // 2]
+    keep = [i for i, (s, e, _p, a) in enumerate(notes)
+            if (e - s) * a >= floor_sal]
+    if len(keep) < 8:
+        keep = list(range(len(notes)))
+    sub = [notes[i] for i in keep]
+
+    vid_sub = separate(sub, tol)
+    if not vid_sub:
+        return []
+    vid = [None] * len(notes)
+    for k, i in enumerate(keep):
+        vid[i] = vid_sub[k]
     # "Highest" by mean pitch, but only among voices that are actually
     # THERE. Height alone is fooled by rubbish: twenty stray detections
     # scattered above the music form their own sparse top voice, and a
@@ -167,8 +191,11 @@ def top_voice(notes: Sequence[Note], tol: float = 0.08,
     from collections import defaultdict
     acc = defaultdict(list)
     for i, v in enumerate(vid):
-        acc[v].append(notes[i][2])
-    floor = max(3, int(min_share * len(notes)))
+        if v is not None:
+            acc[v].append(notes[i][2])
+    if not acc:
+        return []
+    floor = max(3, int(min_share * len(keep)))
     real = {v: ps for v, ps in acc.items() if len(ps) >= floor} or acc
     best = max(real, key=lambda v: sum(real[v]) / len(real[v]))
     return [i for i, v in enumerate(vid) if v == best]
